@@ -1,0 +1,45 @@
+{
+  "name": "react-vite-tailwind",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "ios:install": "npm install @capacitor/core @capacitor/cli @capacitor/ios",
+    "ios:add": "npx cap add ios",
+    "ios:sync": "npm run build && npx cap sync ios && npm run ios:pods:fix",
+    "ios:pods:fix": "bash scripts/ios-fix-firebase-analytics-pod.sh && (cd ios/App && pod install)",
+    "ios:open": "npx cap open ios",
+    "ios:doctor": "npx cap doctor",
+    "ios:run": "npm run ios:sync && npx cap run ios"
+  },
+  "dependencies": {
+    "@capacitor-firebase/analytics": "^7.5.0",
+    "@capacitor-firebase/app": "^7.5.0",
+    "@capacitor-firebase/crashlytics": "^7.5.0",
+    "@capacitor-firebase/messaging": "^7.5.0",
+    "@capacitor-firebase/remote-config": "^7.5.0",
+    "@capacitor/app": "^7.1.2",
+    "@capacitor/core": "^7.5.0",
+    "clsx": "2.1.1",
+    "peerjs": "^1.5.5",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "tailwind-merge": "3.4.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^7.5.0",
+    "@capacitor/ios": "^7.5.0",
+    "@tailwindcss/vite": "4.1.17",
+    "@types/node": "^22.0.0",
+    "@types/react": "19.2.7",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "5.1.1",
+    "tailwindcss": "4.1.17",
+    "typescript": "5.9.3",
+    "vite": "7.2.4",
+    "vite-plugin-singlefile": "2.3.0"
+  }
+}
