@@ -16,6 +16,15 @@ function publishPrivacyStatus(required: boolean): void {
   window.dispatchEvent(new CustomEvent(PRIVACY_STATUS_EVENT, { detail: { required } }));
 }
 
+async function requestIosTrackingAuthorization(): Promise<void> {
+  if (Capacitor.getPlatform() !== "ios") return;
+
+  const trackingInfo = await AdMob.trackingAuthorizationStatus();
+  if (trackingInfo.status === "notDetermined") {
+    await AdMob.requestTrackingAuthorization();
+  }
+}
+
 export function isAdPrivacyOptionsRequired(): boolean {
   return privacyOptionsRequired;
 }
@@ -51,6 +60,9 @@ export function initializeAdMob(): Promise<boolean> {
         consentInfo = await AdMob.showConsentForm();
       }
       publishPrivacyStatus(consentInfo.privacyOptionsRequirementStatus === "REQUIRED");
+      if (consentInfo.canRequestAds) {
+        await requestIosTrackingAuthorization();
+      }
       return consentInfo.canRequestAds;
     } catch (error) {
       console.error("[AdMob] initialization or consent failed", error);
