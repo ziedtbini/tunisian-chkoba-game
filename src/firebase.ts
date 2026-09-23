@@ -6,9 +6,6 @@ declare global {
   }
 }
 
-type PermissionResult = { receive?: string };
-type TokenResult = { token?: string };
-
 type FirebaseAppPlugin = {
   getName?: () => Promise<{ name: string }>;
 };
@@ -24,24 +21,10 @@ type FirebaseCrashlyticsPlugin = {
   testCrash?: () => Promise<void>;
 };
 
-type FirebaseMessagingPlugin = {
-  checkPermissions?: () => Promise<PermissionResult>;
-  requestPermissions?: () => Promise<PermissionResult>;
-  getToken?: () => Promise<TokenResult>;
-  addListener?: (
-    eventName: string,
-    listenerFunc: (event: unknown) => void
-  ) => Promise<unknown> | unknown;
-};
-
 const FirebaseApp = registerPlugin<FirebaseAppPlugin>("FirebaseApp");
 const FirebaseAnalytics = registerPlugin<FirebaseAnalyticsPlugin>("FirebaseAnalytics");
 const FirebaseCrashlytics = registerPlugin<FirebaseCrashlyticsPlugin>("FirebaseCrashlytics");
-const FirebaseMessaging = registerPlugin<FirebaseMessagingPlugin>("FirebaseMessaging");
-
 let didInitFirebase = false;
-let didEnablePush = false;
-let didAttachPushListeners = false;
 
 const isNativePlatform = (): boolean => {
   const platform = Capacitor.getPlatform();
@@ -60,12 +43,10 @@ export async function initFirebase(): Promise<void> {
   const hasApp = Capacitor.isPluginAvailable("FirebaseApp");
   const hasAnalytics = Capacitor.isPluginAvailable("FirebaseAnalytics");
   const hasCrashlytics = Capacitor.isPluginAvailable("FirebaseCrashlytics");
-  const hasMessaging = Capacitor.isPluginAvailable("FirebaseMessaging");
   console.log("[Firebase] plugin availability", {
     app: hasApp,
     analytics: hasAnalytics,
     crashlytics: hasCrashlytics,
-    messaging: hasMessaging,
   });
 
   try {
@@ -98,56 +79,6 @@ export async function initFirebase(): Promise<void> {
     }
   } catch (error) {
     console.log("[Firebase] crashlytics init error", error);
-  }
-}
-
-export async function enablePush(): Promise<void> {
-  if (didEnablePush) return;
-  didEnablePush = true;
-
-  if (!isNativePlatform()) {
-    console.log("[Firebase] skip push setup on web platform");
-    return;
-  }
-
-  if (!Capacitor.isPluginAvailable("FirebaseMessaging")) {
-    console.log("[Firebase] messaging plugin unavailable on native runtime");
-    return;
-  }
-
-  try {
-    const before = await FirebaseMessaging.checkPermissions?.();
-    console.log("[Firebase] push permission before request", before);
-    const permissions = await FirebaseMessaging.requestPermissions?.();
-    console.log("[Firebase] push permissions", permissions);
-  } catch (error) {
-    console.log("[Firebase] requestPermissions error", error);
-  }
-
-  try {
-    const tokenResult = await FirebaseMessaging.getToken?.();
-    console.log("[Firebase] APNs/FCM registration requested");
-    console.log("[Firebase] FCM token", tokenResult?.token ?? "(none)");
-  } catch (error) {
-    console.log("[Firebase] getToken/register error", error);
-  }
-
-  try {
-    if (!didAttachPushListeners && FirebaseMessaging.addListener) {
-      didAttachPushListeners = true;
-      await FirebaseMessaging.addListener("tokenReceived", (event: unknown) => {
-        console.log("[Firebase] tokenReceived", event);
-      });
-      await FirebaseMessaging.addListener("notificationReceived", (event: unknown) => {
-        console.log("[Firebase] notificationReceived", event);
-      });
-      await FirebaseMessaging.addListener("notificationActionPerformed", (event: unknown) => {
-        console.log("[Firebase] notificationActionPerformed", event);
-      });
-      console.log("[Firebase] push listeners attached");
-    }
-  } catch (error) {
-    console.log("[Firebase] listeners error", error);
   }
 }
 

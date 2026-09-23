@@ -10,7 +10,7 @@ Jeu de Chkoba tunisienne en **React + TypeScript + Vite**, avec build natif iOS 
 - Tailwind CSS
 - Capacitor iOS
 - PeerJS (online)
-- Firebase Capacitor plugins (app, messaging, crashlytics, analytics, remote-config)
+- Firebase Capacitor plugins (app, crashlytics, analytics, remote-config)
 
 ## Prerequisites
 
@@ -36,6 +36,18 @@ npm run dev
 npm run build
 npm run preview
 ```
+
+## Validation avant release
+
+```bash
+npm run release:check
+npm run ios:sync:prod
+```
+
+Voir `APP_STORE_RELEASE.md` pour les etapes App Store Connect et TestFlight.
+
+Politique de confidentialite source : `PRIVACY_POLICY.md`.
+Page publique GitHub Pages : `docs/privacy-policy.html`.
 
 ## iOS (Capacitor)
 

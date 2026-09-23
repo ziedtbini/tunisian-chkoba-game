@@ -1,4 +1,4 @@
-import { Card, Suit, Player, Score, GameState, GameMode } from './types';
+import type { Card, Suit, Player, Score, GameState, GameMode } from './types';
 
 const SUITS: Suit[] = ['pique', 'coeur', 'carreau', 'trefle'];
 const RANKS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];

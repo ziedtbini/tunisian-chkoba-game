@@ -1,5 +1,3 @@
-import React from "react";
-
 type QuitConfirmModalProps = {
   open: boolean;
   online: boolean;
@@ -9,7 +7,7 @@ type QuitConfirmModalProps = {
 
 export default function QuitConfirmModal({
   open,
-  online,
+  online: _online,
   onCancel,
   onConfirm,
 }: QuitConfirmModalProps) {

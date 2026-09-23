@@ -1,10 +1,11 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { CardComponent, CardBack } from "./CardComponent";
 import { cardName, createDeck, dealCards, findCaptures } from "./gameLogic";
 import { Card, OnlineMessage } from "./types";
 import { onlineManager, ROOM_CODE_LENGTH } from "./onlineManager";
 import { feedback, setupAudioUnlock } from "./utils/premiumFx";
 import QuitConfirmModal from "./components/QuitConfirmModal";
+import NotEnoughCoinsModal from "./components/NotEnoughCoinsModal";
 
 type Team = "A" | "B";
 type Seat = "p1" | "p2" | "p3" | "p4";
@@ -199,10 +200,26 @@ function applyPlay(state: Game2v2, seat: Seat, cardId: string, captureIds?: stri
 type Props = {
   initialMode: TwoVsTwoMode;
   initialTargetScore?: ScoreTarget;
+  availableMatches: number;
+  onConsumeMatchEntry: () => void;
+  onAddMatchEntry: () => void;
+  rewardedAdOpen: boolean;
+  matchEntryToast: string | null;
+  matchEntryError: string | null;
   onExit: () => void;
 };
 
-export default function Chkoba2v2({ initialMode, initialTargetScore = 11, onExit }: Props) {
+export default function Chkoba2v2({
+  initialMode,
+  initialTargetScore = 11,
+  availableMatches,
+  onConsumeMatchEntry,
+  onAddMatchEntry,
+  rewardedAdOpen,
+  matchEntryToast,
+  matchEntryError,
+  onExit,
+}: Props) {
   const [mode] = useState<TwoVsTwoMode>(initialMode);
   const [game, setGame] = useState<Game2v2>(() => initialize2v2(initialMode, 0, 0, initialTargetScore));
   const [pending, setPending] = useState<PendingChoice | null>(null);
@@ -216,6 +233,8 @@ export default function Chkoba2v2({ initialMode, initialTargetScore = 11, onExit
   const [targetScore, setTargetScore] = useState<ScoreTarget>(initialTargetScore);
   const [showCreateScorePicker, setShowCreateScorePicker] = useState(false);
   const [playerName, setPlayerName] = useState("");
+  const [showNotEnoughMatches, setShowNotEnoughMatches] = useState(false);
+  const [consumeMatchOnConnect, setConsumeMatchOnConnect] = useState(false);
 
   const myTeam: Team = useMemo(() => (onlineManager.isHost ? "A" : "B"), [onlinePhase]);
   const oppTeam: Team = myTeam === "A" ? "B" : "A";
@@ -284,6 +303,10 @@ export default function Chkoba2v2({ initialMode, initialTargetScore = 11, onExit
       onConnected: () => {
         setOnlinePhase("connected");
         setOnlineError("");
+        if (consumeMatchOnConnect) {
+          onConsumeMatchEntry();
+          setConsumeMatchOnConnect(false);
+        }
         const resolvedName = playerName.trim() || (onlineManager.isHost ? "Joueur 1" : "Joueur 2");
         onlineManager.send({ type: "2v2-player-name", payload: { name: resolvedName } });
         if (onlineManager.isHost) {
@@ -300,9 +323,10 @@ export default function Chkoba2v2({ initialMode, initialTargetScore = 11, onExit
       onError: (err) => {
         setOnlineError(err);
         setOnlinePhase("error");
+        setConsumeMatchOnConnect(false);
       },
     });
-  }, [mode, targetScore, playerName]);
+  }, [mode, targetScore, playerName, consumeMatchOnConnect, onConsumeMatchEntry]);
 
   useEffect(() => {
     if (game.phase !== "playing") return;
@@ -408,15 +432,21 @@ export default function Chkoba2v2({ initialMode, initialTargetScore = 11, onExit
   };
 
   const createRoom = async (chosenTargetScore: ScoreTarget) => {
+    if (availableMatches < 1) {
+      setShowNotEnoughMatches(true);
+      return;
+    }
     setTargetScore(chosenTargetScore);
     setOnlineError("");
     setOnlinePhase("creating");
+    setConsumeMatchOnConnect(true);
     try {
       const code = await onlineManager.createRoom();
       setRoomCode(code);
       setOnlinePhase("waiting");
     } catch {
       setOnlinePhase("error");
+      setConsumeMatchOnConnect(false);
     }
   };
 
@@ -428,10 +458,15 @@ export default function Chkoba2v2({ initialMode, initialTargetScore = 11, onExit
   const confirmQuit = () => {
     setShowQuitConfirm(false);
     if (mode === "online") onlineManager.destroy();
+    setConsumeMatchOnConnect(false);
     onExit();
   };
 
   const joinRoom = async () => {
+    if (availableMatches < 1) {
+      setShowNotEnoughMatches(true);
+      return;
+    }
     const code = onlineManager.normalizeRoomCode(joinCode);
     if (code.length !== ROOM_CODE_LENGTH) {
       setOnlineError(`Code room ${ROOM_CODE_LENGTH} caracteres`);
@@ -439,10 +474,12 @@ export default function Chkoba2v2({ initialMode, initialTargetScore = 11, onExit
     }
     setOnlineError("");
     setOnlinePhase("joining");
+    setConsumeMatchOnConnect(true);
     try {
       await onlineManager.joinRoom(code);
     } catch {
       setOnlinePhase("error");
+      setConsumeMatchOnConnect(false);
     }
   };
 
@@ -456,6 +493,31 @@ export default function Chkoba2v2({ initialMode, initialTargetScore = 11, onExit
           </h1>
           <p className="text-green-300">Jouez en equipe avec un ami a distance</p>
         </div>
+
+        {(onlinePhase === "idle" || onlinePhase === "error") && (
+          <div className="w-full max-w-sm mb-4">
+            <div className="bg-cyan-400/90 text-cyan-950 rounded-2xl px-4 py-3 flex items-center justify-between shadow-[0_14px_30px_rgba(0,0,0,0.24)] border border-cyan-100/40">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="text-lg">🎬</span>
+                <span className="font-bold text-sm truncate">Parties disponibles : {availableMatches}</span>
+              </div>
+              <button
+                onClick={onAddMatchEntry}
+                className="rounded-full border border-cyan-200/70 bg-white/40 hover:bg-white/55 transition-colors px-3 py-1 text-sm font-semibold"
+                title="Regarder une vidéo pour gagner une partie"
+                aria-label="Ajouter une partie via vidéo"
+                disabled={rewardedAdOpen}
+              >
+                + Ajouter
+              </button>
+            </div>
+            {matchEntryError && (
+              <div className="mt-2 bg-red-900/40 border border-red-500/30 rounded-xl p-3 text-red-300 text-xs text-center">
+                ⚠️ {matchEntryError}
+              </div>
+            )}
+          </div>
+        )}
 
         {(onlinePhase === "idle" || onlinePhase === "error") && (
           <div className="w-full max-w-sm space-y-4">
@@ -586,11 +648,31 @@ export default function Chkoba2v2({ initialMode, initialTargetScore = 11, onExit
           onClick={() => {
             feedback("button");
             if (mode === "online") onlineManager.destroy();
+            setConsumeMatchOnConnect(false);
             onExit();
           }}
         >
           ← Quitter
         </button>
+
+        <NotEnoughCoinsModal
+          open={showNotEnoughMatches}
+          title="Pas assez de parties"
+          message="Vous n'avez plus de parties disponibles pour jouer en ligne."
+          primaryLabel="Gagner une partie"
+          secondaryLabel="Annuler"
+          onCancel={() => setShowNotEnoughMatches(false)}
+          onEarnCoins={() => {
+            feedback("button");
+            setShowNotEnoughMatches(false);
+          }}
+        />
+
+        {matchEntryToast && (
+          <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[95] premium-panel rounded-full px-4 py-2 text-emerald-200 text-sm font-bold">
+            {matchEntryToast}
+          </div>
+        )}
       </div>
     );
   }

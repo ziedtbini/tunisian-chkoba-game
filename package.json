@@ -1,25 +1,41 @@
 {
   "name": "react-vite-tailwind",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "build:test": "vite build --mode test",
+    "build:prod": "vite build --mode production",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "release:validate": "node scripts/validate-release.mjs",
+    "release:check": "npm run release:validate && npm run typecheck && npm test && npm run build:prod",
     "preview": "vite preview",
     "ios:install": "npm install @capacitor/core @capacitor/cli @capacitor/ios",
     "ios:add": "npx cap add ios",
     "ios:sync": "npm run build && npx cap sync ios && npm run ios:pods:fix",
+    "ios:prepare:admob:test": "node scripts/set-admob-ios-app-id.mjs test",
+    "ios:prepare:admob:prod": "node scripts/set-admob-ios-app-id.mjs production",
+    "ios:sync:test": "npm run ios:prepare:admob:test && npm run build:test && npx cap sync ios && npm run ios:pods:fix",
+    "ios:sync:prod": "npm run ios:prepare:admob:prod && npm run build:prod && npx cap sync ios && npm run ios:pods:fix",
     "ios:pods:fix": "bash scripts/ios-fix-firebase-analytics-pod.sh && (cd ios/App && pod install)",
     "ios:open": "npx cap open ios",
     "ios:doctor": "npx cap doctor",
-    "ios:run": "npm run ios:sync && npx cap run ios"
+    "ios:run": "npm run ios:sync && npx cap run ios",
+    "android:prepare:admob:test": "node scripts/set-admob-android-app-id.mjs test",
+    "android:prepare:admob:prod": "node scripts/set-admob-android-app-id.mjs production",
+    "android:sync:test": "npm run android:prepare:admob:test && npm run build:test && npx cap sync android",
+    "android:sync:prod": "npm run android:prepare:admob:prod && npm run build:prod && npx cap sync android",
+    "android:open": "npx cap open android"
   },
   "dependencies": {
+    "@capacitor-community/admob": "^8.0.0",
     "@capacitor-firebase/analytics": "^7.5.0",
     "@capacitor-firebase/app": "^7.5.0",
     "@capacitor-firebase/crashlytics": "^7.5.0",
-    "@capacitor-firebase/messaging": "^7.5.0",
     "@capacitor-firebase/remote-config": "^7.5.0",
     "@capacitor/app": "^7.1.2",
     "@capacitor/core": "^7.5.0",
@@ -40,6 +56,7 @@
     "tailwindcss": "4.1.17",
     "typescript": "5.9.3",
     "vite": "7.2.4",
-    "vite-plugin-singlefile": "2.3.0"
+    "vite-plugin-singlefile": "2.3.0",
+    "vitest": "^4.1.11"
   }
 }
