@@ -44,7 +44,7 @@ https://ziedtbini.github.io/tunisian-chkoba-game/privacy-policy.html
 
 ## URL marketing / site du développeur
 
-À remplacer par un domaine qui expose `app-ads.txt` à sa racine avant publication.
+https://ziedtbini.github.io
 
 ## Notes pour la vérification Apple
 
