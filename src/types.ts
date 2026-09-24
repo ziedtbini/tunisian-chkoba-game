@@ -47,10 +47,4 @@ export interface GameState {
   showChkoba: PlayerSide | null;
 }
 
-// Online-specific types
 export type OnlinePhase = 'idle' | 'creating' | 'waiting' | 'joining' | 'connected' | 'disconnected' | 'error';
-
-export interface OnlineMessage {
-  type: 'game-state' | 'play-card' | 'capture-choice' | 'next-round' | 'play-again' | 'ping' | 'pong' | 'player-name' | 'sync-request' | '2v2-state' | '2v2-play' | '2v2-sync' | '2v2-player-name';
-  payload?: any;
-}

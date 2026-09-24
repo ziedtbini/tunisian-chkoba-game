@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Card, GameState, Score, GameMode, PlayerSide, OnlinePhase, OnlineMessage } from './types';
+import { App as CapacitorApp } from '@capacitor/app';
+import { Card, GameState, Score, GameMode, PlayerSide, OnlinePhase } from './types';
 import { CardComponent, CardBack } from './CardComponent';
 import {
   findCaptures,
@@ -21,24 +22,35 @@ import OnlineMenuScreen from './screens/OnlineMenuScreen';
 import ClassicMenuScreen from './screens/ClassicMenuScreen';
 import { DEFAULT_MATCH_ENTRIES, loadMatchEntries, saveMatchEntries } from './game/matchEntries';
 import { showRewardedMatchEntryAd } from './services/admobService';
+import { oneVOneSession } from './online/oneVOneSession';
+import type { Online1v1View } from './online/protocol';
 
 type VisualTheme = 'classic' | 'gold' | 'royal';
 type ScoreTarget = 11 | 21;
 type CaptureFx = { key: number; playedCard: Card; capturedCards: Card[] };
 const ONLINE_MATCH_COST = 1;
 
-function isObject(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === 'object';
-}
-
-function readString(value: unknown): string | null {
-  return typeof value === 'string' ? value : null;
-}
-
-function readStringArray(value: unknown): string[] | null {
-  if (!Array.isArray(value)) return null;
-  if (!value.every((v) => typeof v === 'string')) return null;
-  return value as string[];
+function gameStateFrom1v1View(view: Online1v1View): GameState {
+  return {
+    phase: view.phase,
+    mode: 'online',
+    deck: [],
+    table: view.table,
+    player1: { name: view.player1.name, hand: view.mySide === 'player1' ? view.myHand : [], captured: view.player1.captured, chkobas: view.player1.chkobas },
+    player2: { name: view.player2.name, hand: view.mySide === 'player2' ? view.myHand : [], captured: view.player2.captured, chkobas: view.player2.chkobas },
+    currentTurn: view.currentTurn,
+    lastCapture: view.lastCapture,
+    player1Score: view.player1Score,
+    player2Score: view.player2Score,
+    roundScorePlayer1: view.roundScorePlayer1,
+    roundScorePlayer2: view.roundScorePlayer2,
+    targetScore: view.targetScore,
+    message: view.message,
+    selectedCard: view.selectedCard,
+    possibleCaptures: view.possibleCaptures,
+    lastAction: view.lastAction,
+    showChkoba: view.showChkoba,
+  };
 }
 
 export const ChkobaGame: React.FC = () => {
@@ -53,6 +65,7 @@ export const ChkobaGame: React.FC = () => {
   const [scoreFx, setScoreFx] = useState({ p1: false, p2: false });
   const prevScoreRef = useRef<{ p1: number; p2: number } | null>(null);
   const timerRef = useRef<number | null>(null);
+  const gameRef = useRef<GameState | null>(null);
 
   // Online state
   const [onlinePhase, setOnlinePhase] = useState<OnlinePhase>('idle');
@@ -75,12 +88,78 @@ export const ChkobaGame: React.FC = () => {
   const [rewardedAdOpen, setRewardedAdOpen] = useState(false);
   const [matchEntryToast, setMatchEntryToast] = useState<string | null>(null);
   const [matchEntryError, setMatchEntryError] = useState<string | null>(null);
+  const [onlineHandCounts, setOnlineHandCounts] = useState<Record<PlayerSide, number>>({ player1: 0, player2: 0 });
+
+  useEffect(() => {
+    gameRef.current = game;
+  }, [game]);
 
   useEffect(() => {
     return () => {
       if (timerRef.current) clearTimeout(timerRef.current);
     };
   }, []);
+
+  useEffect(() => {
+    if (mode2v2) return;
+    oneVOneSession.configure({
+      createHostState: (guestName) => {
+        const initial = initializeRound(0, 0, onlineTargetScore, 'online');
+        return {
+          ...initial,
+          player1: { ...initial.player1, name: playerName.trim() || 'Joueur 1' },
+          player2: { ...initial.player2, name: guestName },
+        };
+      },
+      onHostState: (state) => {
+        gameRef.current = state;
+        setGame(state);
+        setBusy(false);
+      },
+      onGuestView: (view) => {
+        setMySide('player2');
+        setOnlineHandCounts({ player1: view.player1.handCount, player2: view.player2.handCount });
+        const state = gameStateFrom1v1View(view);
+        gameRef.current = state;
+        setGame(state);
+        setBusy(false);
+      },
+      onSessionConnected: (reconnected) => {
+        setOnlinePhase('connected');
+        setOnlineError('');
+        if (!reconnected && consumeMatchOnOnlineStart) {
+          setAvailableMatches((prev) => Math.max(0, prev - ONLINE_MATCH_COST));
+          setConsumeMatchOnOnlineStart(false);
+        }
+        if (onlineManager.isHost) setMySide('player1');
+      },
+      onReconnecting: (attempt) => {
+        setOnlinePhase('disconnected');
+        setOnlineError(`Connexion perdue. Reconnexion… (${attempt})`);
+      },
+      onDisconnected: () => {
+        setOnlinePhase('disconnected');
+        setOnlineError('Connexion perdue. Tentative de reconnexion…');
+      },
+      onError: (message) => {
+        setOnlineError(message);
+        setOnlinePhase('error');
+        setConsumeMatchOnOnlineStart(false);
+      },
+      onNextRoundRequested: () => {
+        const current = gameRef.current;
+        if (!current || current.phase !== 'roundEnd') return null;
+        const next = initializeRound(current.player1Score, current.player2Score, current.targetScore, 'online');
+        return { ...next, player1: { ...next.player1, name: current.player1.name }, player2: { ...next.player2, name: current.player2.name } };
+      },
+      onRematchRequested: () => {
+        const current = gameRef.current;
+        if (!current || current.phase !== 'gameOver') return null;
+        const next = initializeRound(0, 0, current.targetScore, 'online');
+        return { ...next, player1: { ...next.player1, name: current.player1.name }, player2: { ...next.player2, name: current.player2.name } };
+      },
+    });
+  }, [mode2v2, onlineTargetScore, playerName, consumeMatchOnOnlineStart]);
 
   useEffect(() => {
     setupAudioUnlock();
@@ -172,173 +251,33 @@ export const ChkobaGame: React.FC = () => {
     }
   };
 
-  // ---- Online message handler ----
-  const handleOnlineMessage = useCallback((msg: OnlineMessage) => {
-    switch (msg.type) {
-      case 'game-state':
-        setGame(msg.payload as GameState);
-        setBusy(false);
-        break;
-      case 'play-card': {
-        // The host processes the card play and sends back the new state
-        // Only the host processes game logic
-        if (onlineManager.isHost) {
-          const cardId = isObject(msg.payload) ? readString(msg.payload.cardId) : null;
-          if (!cardId) break;
-          setGame(prev => {
-            if (!prev || prev.phase !== 'playing') return prev;
-            // In 1v1 online, remote peer is always player2.
-            if (prev.currentTurn !== 'player2') return prev;
-            const who = prev.currentTurn;
-            const actor = prev[who];
-            const card = actor.hand.find((c: Card) => c.id === cardId);
-            if (!card) return prev;
-
-            const captures = findCaptures(card, prev.table);
-            if (captures.length === 0) {
-              const newHand = actor.hand.filter((c: Card) => c.id !== card.id);
-              const nextTurn = otherSide(who);
-              const newState: GameState = {
-                ...prev,
-                [who]: { ...actor, hand: newHand },
-                table: [...prev.table, card],
-                selectedCard: null,
-                possibleCaptures: null,
-                currentTurn: nextTurn,
-                phase: 'playing',
-                message: `${actor.name} a posé ${cardName(card)} sur la table.`,
-                lastAction: 'drop',
-                showChkoba: null,
-              };
-              onlineManager.send({ type: 'game-state', payload: newState });
-              return newState;
-            }
-            if (captures.length === 1) {
-              const newState = doCapture(prev, card, captures[0], who);
-              onlineManager.send({ type: 'game-state', payload: newState });
-              return newState;
-            }
-            // Multiple captures - send back to let the player choose
-            const stateWithChoices: GameState = {
-              ...prev,
-              selectedCard: card,
-              possibleCaptures: captures,
-              message: `${actor.name} choisit les cartes à capturer...`,
-            };
-            onlineManager.send({ type: 'game-state', payload: stateWithChoices });
-            return stateWithChoices;
-          });
-        }
-        break;
-      }
-      case 'capture-choice': {
-        if (onlineManager.isHost) {
-          const captureIds = isObject(msg.payload) ? readStringArray(msg.payload.captureIds) : null;
-          if (!captureIds) break;
-          setGame(prev => {
-            if (!prev || !prev.selectedCard) return prev;
-            // In 1v1 online, remote peer is always player2.
-            if (prev.currentTurn !== 'player2') return prev;
-            const capture = prev.table.filter((c: Card) => captureIds.includes(c.id));
-            if (capture.length === 0) return prev;
-            const newState = doCapture(prev, prev.selectedCard, capture, prev.currentTurn);
-            onlineManager.send({ type: 'game-state', payload: newState });
-            return newState;
-          });
-        }
-        break;
-      }
-      case 'next-round': {
-        if (onlineManager.isHost) {
-          setGame(prev => {
-            if (!prev) return null;
-            const newState = initializeRound(prev.player1Score, prev.player2Score, prev.targetScore, 'online');
-            onlineManager.send({ type: 'game-state', payload: newState });
-            return newState;
-          });
-        }
-        break;
-      }
-      case 'play-again': {
-        if (onlineManager.isHost) {
-          setGame(prev => {
-            const target = (prev?.targetScore as ScoreTarget | undefined) ?? onlineTargetScore;
-            const newState = initializeRound(0, 0, target, 'online');
-            onlineManager.send({ type: 'game-state', payload: newState });
-            return newState;
-          });
-        }
-        break;
-      }
-      case 'player-name': {
-        const name = isObject(msg.payload) ? readString(msg.payload.name) : null;
-        const resolved = name || '';
-        setGame(prev => {
-          if (!prev || !resolved) return prev;
-          const updated = onlineManager.isHost
-            ? { ...prev, player2: { ...prev.player2, name: resolved } }
-            : { ...prev, player1: { ...prev.player1, name: resolved } };
-          if (onlineManager.isHost) {
-            onlineManager.send({ type: 'game-state', payload: updated });
-          }
-          return updated;
-        });
-        break;
-      }
-      case 'sync-request': {
-        if (onlineManager.isHost) {
-          setGame(prev => {
-            const syncedState = prev ?? initializeRound(0, 0, onlineTargetScore, 'online');
-            onlineManager.send({ type: 'game-state', payload: syncedState });
-            return syncedState;
-          });
-        }
-        break;
-      }
+  const updateGameState = useCallback((updater: (state: GameState) => GameState) => {
+    if (onlineManager.isHost && gameRef.current?.mode === 'online') {
+      oneVOneSession.updateHostState(updater);
+      return;
     }
-  }, [onlineTargetScore]);
+    setGame((current) => current ? updater(current) : current);
+  }, []);
 
-  // ---- Setup online callbacks ----
   useEffect(() => {
-    onlineManager.setCallbacks({
-      onMessage: handleOnlineMessage,
-      onConnected: () => {
-        setOnlinePhase('connected');
-        setOnlineError('');
-        if (consumeMatchOnOnlineStart) {
-          setAvailableMatches((prev) => Math.max(0, prev - ONLINE_MATCH_COST));
-          setConsumeMatchOnOnlineStart(false);
-        }
-        // Send player name
-        const name = playerName || (onlineManager.isHost ? 'Joueur 1' : 'Joueur 2');
-        onlineManager.send({ type: 'player-name', payload: { name } });
-
-        if (onlineManager.isHost) {
-          // Host starts the game
-          const initialState = initializeRound(0, 0, onlineTargetScore, 'online');
-          const hostNamedState: GameState = {
-            ...initialState,
-            player1: { ...initialState.player1, name },
-          };
-          setGame(hostNamedState);
-          onlineManager.send({ type: 'game-state', payload: hostNamedState });
-          setMySide('player1');
-        } else {
-          setMySide('player2');
-          // Ask host to force-sync state in case first game-state was missed.
-          onlineManager.send({ type: 'sync-request' });
-        }
-      },
-      onDisconnected: () => {
-        setOnlinePhase('disconnected');
-      },
-      onError: (err) => {
-        setOnlineError(err);
-        setOnlinePhase('error');
-        setConsumeMatchOnOnlineStart(false);
-      },
+    const resume = () => {
+      if (!showOnlineLobby && game?.mode !== 'online' && !mode2v2) return;
+      onlineManager.reconnectSignalling();
+      if (onlineManager.isConnected() && !onlineManager.isHost && !mode2v2) {
+        oneVOneSession.requestSync();
+      }
+    };
+    window.addEventListener('online', resume);
+    document.addEventListener('visibilitychange', resume);
+    const appStateListener = CapacitorApp.addListener('appStateChange', ({ isActive }) => {
+      if (isActive) resume();
     });
-  }, [handleOnlineMessage, playerName, onlineTargetScore, consumeMatchOnOnlineStart]);
+    return () => {
+      window.removeEventListener('online', resume);
+      document.removeEventListener('visibilitychange', resume);
+      void appStateListener.then((listener) => listener.remove());
+    };
+  }, [showOnlineLobby, game?.mode, mode2v2]);
 
   // ---- Online actions ----
   const createOnlineRoom = async (targetScore: ScoreTarget) => {
@@ -352,7 +291,7 @@ export const ChkobaGame: React.FC = () => {
     setOnlinePhase('creating');
     setConsumeMatchOnOnlineStart(true);
     try {
-      const code = await onlineManager.createRoom();
+      const code = await oneVOneSession.createRoom();
       setRoomCode(code);
       setOnlinePhase('waiting');
     } catch {
@@ -376,7 +315,7 @@ export const ChkobaGame: React.FC = () => {
     setOnlinePhase('joining');
     setConsumeMatchOnOnlineStart(true);
     try {
-      await onlineManager.joinRoom(normalizedCode);
+      await oneVOneSession.joinRoom(normalizedCode, playerName);
     } catch {
       setOnlinePhase('error');
       setConsumeMatchOnOnlineStart(false);
@@ -386,7 +325,7 @@ export const ChkobaGame: React.FC = () => {
   const leaveOnline = () => {
     clearTimer();
     setBusy(false);
-    onlineManager.destroy();
+    oneVOneSession.destroy();
     setOnlinePhase('idle');
     setGame(null);
     setRoomCode('');
@@ -463,54 +402,8 @@ export const ChkobaGame: React.FC = () => {
   // ---- A player plays a card ----
   const handlePlayCard = (card: Card, who: PlayerSide) => {
     if (game?.mode === 'online') {
-      // In online mode, send the action to host
-      if (who === mySide) {
-        if (onlineManager.isHost) {
-          // Host processes locally
-          setGame(prev => {
-            if (!prev || prev.currentTurn !== who || prev.phase !== 'playing') return prev;
-            if (prev.selectedCard?.id === card.id) {
-              const s: GameState = { ...prev, selectedCard: null, possibleCaptures: null, message: `${prev[who].name}, sélectionnez une carte.` };
-              onlineManager.send({ type: 'game-state', payload: s });
-              return s;
-            }
-            const captures = findCaptures(card, prev.table);
-            if (captures.length === 0) {
-              const newHand = prev[who].hand.filter((c: Card) => c.id !== card.id);
-              const nextTurn = otherSide(who);
-              const s: GameState = {
-                ...prev,
-                [who]: { ...prev[who], hand: newHand },
-                table: [...prev.table, card],
-                selectedCard: null,
-                possibleCaptures: null,
-                currentTurn: nextTurn,
-                phase: 'playing',
-                message: `${prev[who].name} a posé ${cardName(card)} sur la table.`,
-                lastAction: 'drop',
-                showChkoba: null,
-              };
-              onlineManager.send({ type: 'game-state', payload: s });
-              return s;
-            }
-            if (captures.length === 1) {
-              const s = doCapture(prev, card, captures[0], who);
-              onlineManager.send({ type: 'game-state', payload: s });
-              return s;
-            }
-            const s: GameState = {
-              ...prev,
-              selectedCard: card,
-              possibleCaptures: captures,
-              message: 'Choisissez les cartes à capturer.',
-            };
-            onlineManager.send({ type: 'game-state', payload: s });
-            return s;
-          });
-        } else {
-          // Guest sends play request to host
-          onlineManager.send({ type: 'play-card', payload: { cardId: card.id } });
-        }
+      if (who === mySide && game.currentTurn === mySide && game.phase === 'playing') {
+        oneVOneSession.playCard(card.id);
       }
       return;
     }
@@ -553,18 +446,8 @@ export const ChkobaGame: React.FC = () => {
 
   const handleCaptureChoice = (captureGroup: Card[]) => {
     if (game?.mode === 'online') {
-      if (game.currentTurn !== mySide) return;
-      if (onlineManager.isHost) {
-        setGame(prev => {
-          if (!prev || !prev.selectedCard) return prev;
-          if (prev.currentTurn !== mySide) return prev;
-          const s = doCapture(prev, prev.selectedCard, captureGroup, prev.currentTurn);
-          onlineManager.send({ type: 'game-state', payload: s });
-          return s;
-        });
-      } else {
-        onlineManager.send({ type: 'capture-choice', payload: { captureIds: captureGroup.map(c => c.id) } });
-      }
+      if (game.currentTurn !== mySide || !game.selectedCard) return;
+      oneVOneSession.chooseCapture(game.selectedCard.id, captureGroup.map((card) => card.id));
       return;
     }
 
@@ -637,8 +520,7 @@ export const ChkobaGame: React.FC = () => {
       if (game.deck.length > 0) {
         setBusy(true);
         timerRef.current = window.setTimeout(() => {
-          setGame(prev => {
-            if (!prev) return null;
+          updateGameState(prev => {
             const { dealt: p1Hand, remaining: d1 } = dealCards(prev.deck, 3);
             const { dealt: p2Hand, remaining: d2 } = dealCards(d1, 3);
             const nextTurn: PlayerSide = 'player1';
@@ -653,9 +535,6 @@ export const ChkobaGame: React.FC = () => {
               message: 'Nouvelles cartes distribuées !',
               showChkoba: null,
             };
-            if (prev.mode === 'online' && onlineManager.isHost) {
-              onlineManager.send({ type: 'game-state', payload: newState });
-            }
             return newState;
           });
           setBusy(false);
@@ -664,8 +543,7 @@ export const ChkobaGame: React.FC = () => {
       } else {
         setBusy(true);
         timerRef.current = window.setTimeout(() => {
-          setGame(prev => {
-            if (!prev) return null;
+          updateGameState(prev => {
             const p1 = { ...prev.player1, captured: [...prev.player1.captured] };
             const p2 = { ...prev.player2, captured: [...prev.player2.captured] };
 
@@ -704,9 +582,6 @@ export const ChkobaGame: React.FC = () => {
               selectedCard: null,
               possibleCaptures: null,
             };
-            if (prev.mode === 'online' && onlineManager.isHost) {
-              onlineManager.send({ type: 'game-state', payload: newState });
-            }
             return newState;
           });
           setBusy(false);
@@ -770,16 +645,14 @@ export const ChkobaGame: React.FC = () => {
     if (game.mode === 'online' && game.showChkoba && onlineManager.isHost) {
       setBusy(true);
       timerRef.current = window.setTimeout(() => {
-        setGame(prev => {
-          if (!prev) return null;
+        updateGameState(prev => {
           const s: GameState = { ...prev, showChkoba: null };
-          onlineManager.send({ type: 'game-state', payload: s });
           return s;
         });
         setBusy(false);
       }, 2500);
     }
-  }, [game, busy]);
+  }, [game, busy, updateGameState]);
 
   const startNextRound = () => {
     if (!game) return;
@@ -788,10 +661,9 @@ export const ChkobaGame: React.FC = () => {
         clearTimer();
         setBusy(false);
         const newState = initializeRound(game.player1Score, game.player2Score, game.targetScore, 'online');
-        setGame(newState);
-        onlineManager.send({ type: 'game-state', payload: newState });
+        oneVOneSession.publishHostState({ ...newState, player1: { ...newState.player1, name: game.player1.name }, player2: { ...newState.player2, name: game.player2.name } });
       } else {
-        onlineManager.send({ type: 'next-round' });
+        oneVOneSession.requestNextRound();
       }
       return;
     }
@@ -805,10 +677,9 @@ export const ChkobaGame: React.FC = () => {
     if (game.mode === 'online') {
       if (onlineManager.isHost) {
         const newState = initializeRound(0, 0, game.targetScore, 'online');
-        setGame(newState);
-        onlineManager.send({ type: 'game-state', payload: newState });
+        oneVOneSession.publishHostState({ ...newState, player1: { ...newState.player1, name: game.player1.name }, player2: { ...newState.player2, name: game.player2.name } });
       } else {
-        onlineManager.send({ type: 'play-again' });
+        oneVOneSession.requestRematch();
       }
       return;
     }
@@ -976,6 +847,8 @@ export const ChkobaGame: React.FC = () => {
     !!game.selectedCard &&
     isCurrentTurnActive &&
     (!isOnline || game.currentTurn === mySide);
+  const visibleHandCount = (side: PlayerSide, actual: number): number =>
+    isOnline && !onlineManager.isHost && side !== mySide ? onlineHandCounts[side] : actual;
 
   const topLabel = isOnline
     ? (topSide === 'player1'
@@ -994,7 +867,7 @@ export const ChkobaGame: React.FC = () => {
   const p2HeaderLabel = isOnline ? (game.player2.name || 'Joueur 2') : (isCpuMode ? 'PC' : 'J2');
 
   return (
-    <div className="premium-screen safe-area premium-entrance min-h-screen text-white flex flex-col select-none">
+    <div className="premium-screen safe-area premium-entrance gameplay-screen text-white select-none">
       {/* Chkoba overlay */}
       {game.showChkoba && (
         <div className="fixed inset-0 z-50 flex items-center justify-center pointer-events-none">
@@ -1028,8 +901,8 @@ export const ChkobaGame: React.FC = () => {
       )}
 
       {/* Header */}
-      <header className="premium-panel px-2 py-1.5 flex items-center gap-2 border-b border-green-300/20 whitespace-nowrap overflow-hidden">
-          <span className="text-base leading-none shrink-0">♠ ♥ ♦ ♣</span>
+      <header className="premium-panel game-hud px-2 py-1.5 flex items-center gap-2 whitespace-nowrap overflow-hidden">
+          <span className="game-hud-suits text-base leading-none shrink-0">♠ <b>♥</b> <b>♦</b> ♣</span>
           <div className="flex items-center gap-1 min-w-0 flex-1 justify-center text-xs">
             <div className="premium-chip rounded-md px-1.5 py-1">
               <span className="text-green-300">{p1HeaderLabel}:</span>{' '}
@@ -1062,8 +935,8 @@ export const ChkobaGame: React.FC = () => {
       )}
 
       {/* Top player area */}
-      <div className="px-4 py-2">
-        <div className="flex items-center gap-2 mb-1">
+      <section className="game-player-zone game-player-zone--opponent px-4 py-2">
+        <div className="game-player-meta flex items-center gap-2 mb-1">
           <span className="text-sm text-green-300">
             {isOnline ? '🌐 ' : ''}{topLabel}
           </span>
@@ -1081,7 +954,7 @@ export const ChkobaGame: React.FC = () => {
             </span>
           )}
         </div>
-        <div className="stagger-row flex gap-2 justify-center min-h-[68px] items-center">
+        <div className="game-card-row stagger-row flex gap-2 justify-center min-h-[68px] items-center">
           {showTopCards ? (
             topPlayer.hand.map((card: Card) => (
               <CardComponent
@@ -1093,22 +966,22 @@ export const ChkobaGame: React.FC = () => {
               />
             ))
           ) : (
-            topPlayer.hand.map((_: Card, i: number) => <CardBack key={i} />)
+            Array.from({ length: visibleHandCount(topSide, topPlayer.hand.length) }, (_, i) => <CardBack key={i} />)
           )}
-          {topPlayer.hand.length === 0 && (
+          {visibleHandCount(topSide, topPlayer.hand.length) === 0 && (
             <div className="text-green-600 text-sm italic">Pas de cartes</div>
           )}
         </div>
-      </div>
+      </section>
 
       {/* Table */}
-      <div className="flex-1 px-4 py-2">
-        <div className="premium-panel rounded-2xl p-4 min-h-[160px] relative">
-          <div className="absolute -top-3 left-4 premium-chip text-green-200 text-xs px-3 py-1 rounded-full">
+      <main className="game-table-zone px-4 py-2">
+        <div className="game-table-surface rounded-2xl p-4 relative">
+          <div className="game-table-label absolute -top-3 left-1/2 -translate-x-1/2 premium-chip text-green-200 text-xs px-3 py-1 rounded-full">
             Table ({game.table.length} carte{game.table.length !== 1 ? 's' : ''})
           </div>
 
-          <div className="stagger-row flex flex-wrap gap-2 justify-center items-center pt-2 min-h-[80px]">
+          <div className="game-table-cards stagger-row flex flex-wrap gap-2 justify-center items-center pt-2 min-h-[80px]">
             {game.table.length === 0 ? (
               <div className="text-green-600 text-sm italic py-8">Table vide</div>
             ) : (
@@ -1157,12 +1030,12 @@ export const ChkobaGame: React.FC = () => {
             </div>
           )}
         </div>
-      </div>
+      </main>
 
       {/* Message */}
-      <div className="px-4 py-1">
+      <div className="game-status-zone px-4 py-1">
         <div className={cn(
-          "text-center text-sm py-2 px-4 rounded-lg transition-colors",
+          "game-status text-center text-sm py-2 px-4 rounded-lg transition-colors",
           game.lastAction.includes('chkoba')
             ? 'bg-amber-500/30 text-amber-200 font-bold'
             : 'bg-black/20 text-green-200',
@@ -1177,8 +1050,8 @@ export const ChkobaGame: React.FC = () => {
       </div>
 
       {/* Bottom player area (Me) */}
-      <div className="px-4 py-3 bg-black/20 border-t border-green-600/20">
-        <div className="flex items-center gap-2 mb-1">
+      <section className="game-player-zone game-player-zone--local px-4 py-3">
+        <div className="game-player-meta flex items-center gap-2 mb-1">
           <span className="text-sm text-amber-300">
             {isOnline ? '👤 ' : '👤 '}{bottomLabel}
           </span>
@@ -1191,7 +1064,7 @@ export const ChkobaGame: React.FC = () => {
             </span>
           )}
         </div>
-        <div className="stagger-row flex gap-3 justify-center min-h-[80px] items-center">
+        <div className="game-card-row game-card-row--local stagger-row flex gap-3 justify-center min-h-[80px] items-center">
           {showBottomCards ? (
             bottomPlayer.hand.map((card: Card) => (
               <CardComponent
@@ -1203,15 +1076,15 @@ export const ChkobaGame: React.FC = () => {
               />
             ))
           ) : (
-            bottomPlayer.hand.map((_: Card, i: number) => <CardBack key={i} />)
+            Array.from({ length: visibleHandCount(bottomSide, bottomPlayer.hand.length) }, (_, i) => <CardBack key={i} />)
           )}
-          {bottomPlayer.hand.length === 0 && (
+          {visibleHandCount(bottomSide, bottomPlayer.hand.length) === 0 && (
             <div className="text-green-600 text-sm italic">
               {game.deck.length > 0 ? 'Distribution en cours...' : 'Fin du round...'}
             </div>
           )}
         </div>
-      </div>
+      </section>
     </div>
   );
 };

@@ -94,9 +94,30 @@ Puis dans Xcode:
 
 ## Online / Multiplayer
 
-- Le mode en ligne utilise un manager PeerJS (`src/onlineManager.ts`).
-- Le host est autoritaire sur l’état de partie.
-- 1v1 online et 2v2 online sont pris en charge dans les écrans gameplay.
+- Le transport utilise PeerJS/WebRTC et le signalling public PeerJS (`src/onlineManager.ts`).
+- Le host conserve l'etat complet et reste la seule autorite sur les actions et les manches.
+- Les actions distantes sont validees cote host (tour, carte possedee et capture exacte).
+- Les snapshots 1v1 envoyes au guest excluent la main du host et le deck.
+- Les snapshots 2v2 envoyes a l'equipe B excluent les mains p1/p3 et le deck.
+- Le protocole v2 est actif en 1v1 et 2v2; aucun état gameplay legacy n'est accepté.
+- La room est verrouillée après admission de la session, surveillée par heartbeat et récupérable pendant 60 secondes avec `matchId` + token.
+- Le retour foreground Capacitor declenche une verification de signalling et une resynchronisation.
+- Le protocole v2, ses validateurs et les projections filtrées sont dans `src/online/`.
+
+### TURN optionnel et limites P2P
+
+Les serveurs STUN Google sont utilises par defaut. Certaines configurations NAT strictes peuvent necessiter TURN.
+Un TURN peut etre fourni sans mettre de secret dans le code avec :
+
+```env
+VITE_TURN_URL=turns:example.invalid:5349
+VITE_TURN_USERNAME=...
+VITE_TURN_CREDENTIAL=...
+```
+
+Sans backend, une partie ne peut pas etre restauree si le processus du telephone host est completement tue : son etat autoritaire n'existe plus. Une interruption reseau ou un passage temporaire en arriere-plan est en revanche retente pendant la fenetre de reconnexion.
+
+Plan de validation sur appareils reels : `docs/ONLINE_TEST_PLAN.md`.
 
 ## Firebase
 

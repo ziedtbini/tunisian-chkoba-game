@@ -1,18 +1,20 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CardComponent, CardBack } from "./CardComponent";
 import { cardName, createDeck, dealCards, findCaptures } from "./gameLogic";
-import { Card, OnlineMessage } from "./types";
+import { Card } from "./types";
 import { onlineManager, ROOM_CODE_LENGTH } from "./onlineManager";
 import { feedback, setupAudioUnlock } from "./utils/premiumFx";
 import QuitConfirmModal from "./components/QuitConfirmModal";
 import NotEnoughCoinsModal from "./components/NotEnoughCoinsModal";
+import { sameIdSet } from "./online/validation";
+import { twoVTwoSession, type Online2v2State } from "./online/twoVTwoSession";
+import type { Online2v2View } from "./online/protocol";
 
 type Team = "A" | "B";
 type Seat = "p1" | "p2" | "p3" | "p4";
 type OnlinePhase = "idle" | "creating" | "waiting" | "joining" | "connected" | "disconnected" | "error";
 type TwoVsTwoMode = "local" | "online";
 type ScoreTarget = 11 | 21;
-type PlayPayload = { seat: Seat; cardId: string; captureIds?: string[] };
 
 type TeamInfo = {
   captured: Card[];
@@ -44,33 +46,6 @@ type PendingChoice = {
 
 const TURN_ORDER: Seat[] = ["p1", "p2", "p3", "p4"];
 const TEAM_OF: Record<Seat, Team> = { p1: "A", p2: "B", p3: "A", p4: "B" };
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object";
-}
-
-function isSeat(value: unknown): value is Seat {
-  return value === "p1" || value === "p2" || value === "p3" || value === "p4";
-}
-
-function readString(value: unknown): string | null {
-  return typeof value === "string" ? value : null;
-}
-
-function parsePlayPayload(value: unknown): PlayPayload | null {
-  if (!isObject(value)) return null;
-  if (!isSeat(value.seat)) return null;
-  if (typeof value.cardId !== "string") return null;
-  if (value.captureIds !== undefined) {
-    if (!Array.isArray(value.captureIds)) return null;
-    if (!value.captureIds.every((v) => typeof v === "string")) return null;
-  }
-  return {
-    seat: value.seat,
-    cardId: value.cardId,
-    captureIds: value.captureIds as string[] | undefined,
-  };
-}
 
 function nextSeat(seat: Seat): Seat {
   const idx = TURN_ORDER.indexOf(seat);
@@ -117,6 +92,28 @@ function initialize2v2(mode: TwoVsTwoMode, teamAScore = 0, teamBScore = 0, targe
     teamB: { captured: [], chkobas: 0, score: teamBScore, roundPoints: 0 },
     targetScore,
     message: "Tour de Joueur 1 (Equipe A)",
+  };
+}
+
+function gameFromOnlineView(view: Online2v2View): Game2v2 {
+  return {
+    phase: view.phase,
+    mode: "online",
+    deck: [],
+    table: view.table,
+    hands: {
+      p1: view.myHands.p1 ?? [],
+      p2: view.myHands.p2 ?? [],
+      p3: view.myHands.p3 ?? [],
+      p4: view.myHands.p4 ?? [],
+    },
+    seatNames: view.seatNames,
+    currentTurn: view.currentTurn,
+    lastCaptureTeam: view.lastCaptureTeam,
+    teamA: view.teamA,
+    teamB: view.teamB,
+    targetScore: view.targetScore,
+    message: view.message,
   };
 }
 
@@ -173,8 +170,12 @@ function applyPlay(state: Game2v2, seat: Seat, cardId: string, captureIds?: stri
 
   let chosen = captures[0];
   if (captureIds && captureIds.length > 0) {
-    const wanted = captures.find((g) => g.length === captureIds.length && g.every((c) => captureIds.includes(c.id)));
-    if (wanted) chosen = wanted;
+    const wanted = captures.find((group) => sameIdSet(captureIds, group.map((item) => item.id)));
+    if (!wanted) return state;
+    chosen = wanted;
+  } else if (captures.length > 0) {
+    // A capture is mandatory; an empty/omitted remote choice cannot drop the card.
+    chosen = captures[0];
   }
 
   const newTable = state.table.filter((tc) => !chosen.some((cc) => cc.id === tc.id));
@@ -235,11 +236,11 @@ export default function Chkoba2v2({
   const [playerName, setPlayerName] = useState("");
   const [showNotEnoughMatches, setShowNotEnoughMatches] = useState(false);
   const [consumeMatchOnConnect, setConsumeMatchOnConnect] = useState(false);
+  const [remoteHandCounts, setRemoteHandCounts] = useState<Record<Seat, number>>({ p1: 0, p2: 0, p3: 0, p4: 0 });
 
   const myTeam: Team = useMemo(() => (onlineManager.isHost ? "A" : "B"), [onlinePhase]);
   const oppTeam: Team = myTeam === "A" ? "B" : "A";
   const controllableSeats: Seat[] = mode === "online" ? (myTeam === "A" ? ["p1", "p3"] : ["p2", "p4"]) : TURN_ORDER;
-  const remoteSeatsForHost: Seat[] = ["p2", "p4"];
 
   useEffect(() => {
     setupAudioUnlock();
@@ -265,74 +266,90 @@ export default function Chkoba2v2({
     gameRef.current = game;
   }, [game]);
 
+  const updateAuthoritativeState = useCallback((updater: (state: Game2v2) => Game2v2) => {
+    if (mode === "online" && onlineManager.isHost) {
+      twoVTwoSession.updateHostState((state) => updater(state) as Online2v2State);
+      return;
+    }
+    setGame(updater);
+  }, [mode]);
+
   useEffect(() => {
     if (mode !== "online") return;
-    const onMessage = (msg: OnlineMessage) => {
-      if (msg.type === "2v2-state") {
-        if (!isObject(msg.payload)) return;
-        setGame(msg.payload as Game2v2);
+    twoVTwoSession.configure({
+      createHostState: (guestName) => {
+        const start = initialize2v2("online", 0, 0, targetScore) as Online2v2State;
+        const hostName = playerName.trim() || "Joueur 1";
+        return { ...start, seatNames: { p1: hostName, p2: guestName, p3: hostName, p4: guestName } };
+      },
+      onHostState: (state) => {
+        gameRef.current = state;
+        setGame(state);
         setPending(null);
-      } else if (msg.type === "2v2-player-name") {
-        const name = isObject(msg.payload) ? readString(msg.payload.name) : null;
-        if (!name) return;
-        setGame((prev) => {
-          const updated: Game2v2 = onlineManager.isHost
-            ? { ...prev, seatNames: { ...prev.seatNames, p2: name, p4: name } }
-            : { ...prev, seatNames: { ...prev.seatNames, p1: name, p3: name } };
-          if (onlineManager.isHost) {
-            onlineManager.send({ type: "2v2-state", payload: updated });
-          }
-          return updated;
-        });
-      } else if (msg.type === "2v2-sync" && onlineManager.isHost) {
-        onlineManager.send({ type: "2v2-state", payload: gameRef.current });
-      } else if (msg.type === "2v2-play" && onlineManager.isHost) {
-        const parsed = parsePlayPayload(msg.payload);
-        if (!parsed) return;
-        const { seat, cardId, captureIds } = parsed;
-        if (!remoteSeatsForHost.includes(seat)) return;
-        setGame((prev) => {
-          const next = applyPlay(prev, seat, cardId, captureIds);
-          onlineManager.send({ type: "2v2-state", payload: next });
-          return next;
-        });
-      }
-    };
-    onlineManager.setCallbacks({
-      onMessage,
-      onConnected: () => {
+      },
+      onGuestView: (view) => {
+        setRemoteHandCounts(view.handCounts);
+        const state = gameFromOnlineView(view);
+        gameRef.current = state;
+        setGame(state);
+        setPending(null);
+      },
+      onSessionConnected: (reconnected) => {
         setOnlinePhase("connected");
         setOnlineError("");
-        if (consumeMatchOnConnect) {
+        if (!reconnected && consumeMatchOnConnect) {
           onConsumeMatchEntry();
           setConsumeMatchOnConnect(false);
         }
-        const resolvedName = playerName.trim() || (onlineManager.isHost ? "Joueur 1" : "Joueur 2");
-        onlineManager.send({ type: "2v2-player-name", payload: { name: resolvedName } });
-        if (onlineManager.isHost) {
-          const start = initialize2v2("online", 0, 0, targetScore);
-          start.seatNames.p1 = resolvedName;
-          start.seatNames.p3 = resolvedName;
-          setGame(start);
-          onlineManager.send({ type: "2v2-state", payload: start });
-        } else {
-          onlineManager.send({ type: "2v2-sync" });
-        }
       },
-      onDisconnected: () => setOnlinePhase("disconnected"),
-      onError: (err) => {
-        setOnlineError(err);
+      onDisconnected: () => {
+        setOnlinePhase("disconnected");
+        setOnlineError("Connexion perdue. Tentative de reconnexion…");
+      },
+      onReconnecting: (attempt) => {
+        setOnlinePhase("disconnected");
+        setOnlineError(`Connexion perdue. Reconnexion… (${attempt})`);
+      },
+      onError: (message) => {
+        setOnlineError(message);
         setOnlinePhase("error");
         setConsumeMatchOnConnect(false);
+      },
+      onNextRoundRequested: () => {
+        const current = gameRef.current;
+        if (current.phase !== "roundEnd") return null;
+        const next = initialize2v2("online", current.teamA.score, current.teamB.score, current.targetScore as ScoreTarget) as Online2v2State;
+        return { ...next, seatNames: current.seatNames };
+      },
+      onRematchRequested: () => {
+        const current = gameRef.current;
+        if (current.phase !== "gameOver") return null;
+        const next = initialize2v2("online", 0, 0, current.targetScore as ScoreTarget) as Online2v2State;
+        return { ...next, seatNames: current.seatNames };
       },
     });
   }, [mode, targetScore, playerName, consumeMatchOnConnect, onConsumeMatchEntry]);
 
   useEffect(() => {
+    if (mode !== "online") return;
+    const resume = () => {
+      onlineManager.reconnectSignalling();
+      if (onlineManager.isConnected() && !onlineManager.isHost) twoVTwoSession.requestSync();
+    };
+    window.addEventListener("online", resume);
+    document.addEventListener("visibilitychange", resume);
+    return () => {
+      window.removeEventListener("online", resume);
+      document.removeEventListener("visibilitychange", resume);
+    };
+  }, [mode]);
+
+  useEffect(() => {
     if (game.phase !== "playing") return;
+    if (mode === "online" && !onlineManager.isHost) return;
     const everyoneEmpty = TURN_ORDER.every((s) => game.hands[s].length === 0);
     if (everyoneEmpty && game.deck.length > 0) {
-      setGame((prev) => {
+      updateAuthoritativeState((prev) => {
         const d1 = dealCards(prev.deck, 3);
         const d2 = dealCards(d1.remaining, 3);
         const d3 = dealCards(d2.remaining, 3);
@@ -344,13 +361,12 @@ export default function Chkoba2v2({
           currentTurn: "p1",
           message: "Nouvelles cartes distribuees",
         };
-        if (mode === "online" && onlineManager.isHost) onlineManager.send({ type: "2v2-state", payload: nextState });
         return nextState;
       });
       return;
     }
     if (everyoneEmpty && game.deck.length === 0) {
-      setGame((prev) => {
+      updateAuthoritativeState((prev) => {
         const tA = { ...prev.teamA };
         const tB = { ...prev.teamB };
         if (prev.table.length > 0 && prev.lastCaptureTeam) {
@@ -371,11 +387,10 @@ export default function Chkoba2v2({
           teamB: tB,
           message: over ? (tA.score >= prev.targetScore ? "Equipe A gagne!" : "Equipe B gagne!") : "Fin du round 2v2",
         };
-        if (mode === "online" && onlineManager.isHost) onlineManager.send({ type: "2v2-state", payload: nextState });
         return nextState;
       });
     }
-  }, [game, mode]);
+  }, [game, mode, updateAuthoritativeState]);
 
   const onPlay = (seat: Seat, card: Card) => {
     if (game.phase !== "playing" || game.currentTurn !== seat) return;
@@ -385,14 +400,13 @@ export default function Chkoba2v2({
       setPending({ seat, card, options });
       return;
     }
-    const captureIds = options[0]?.map((c) => c.id) ?? [];
-    if (mode === "online" && !onlineManager.isHost) {
-      onlineManager.send({ type: "2v2-play", payload: { seat, cardId: card.id, captureIds } });
+    if (mode === "online") {
+      twoVTwoSession.playCard(seat, card.id);
       return;
     }
+    const captureIds = options[0]?.map((captured) => captured.id) ?? [];
     setGame((prev) => {
       const next = applyPlay(prev, seat, card.id, captureIds);
-      if (mode === "online" && onlineManager.isHost) onlineManager.send({ type: "2v2-state", payload: next });
       return next;
     });
   };
@@ -402,33 +416,44 @@ export default function Chkoba2v2({
     if (game.phase !== "playing" || game.currentTurn !== pending.seat) return;
     if (!controllableSeats.includes(pending.seat)) return;
     const captureIds = group.map((c) => c.id);
-    if (mode === "online" && !onlineManager.isHost) {
-      onlineManager.send({ type: "2v2-play", payload: { seat: pending.seat, cardId: pending.card.id, captureIds } });
+    if (mode === "online") {
+      twoVTwoSession.chooseCapture(pending.seat, pending.card.id, captureIds);
       setPending(null);
       return;
     }
     setGame((prev) => {
       const next = applyPlay(prev, pending.seat, pending.card.id, captureIds);
-      if (mode === "online" && onlineManager.isHost) onlineManager.send({ type: "2v2-state", payload: next });
       return next;
     });
     setPending(null);
   };
 
   const startNextRound = () => {
+    if (mode === "online" && !onlineManager.isHost) {
+      twoVTwoSession.requestNextRound();
+      return;
+    }
     const next = initialize2v2(mode, game.teamA.score, game.teamB.score, game.targetScore as ScoreTarget);
     setPending(null);
-    setGame(next);
-    if (mode === "online" && onlineManager.isHost) onlineManager.send({ type: "2v2-state", payload: next });
-    if (mode === "online" && !onlineManager.isHost) onlineManager.send({ type: "2v2-sync" });
+    if (mode === "online" && onlineManager.isHost) {
+      twoVTwoSession.publishHostState({ ...next, seatNames: game.seatNames } as Online2v2State);
+    } else {
+      setGame(next);
+    }
   };
 
   const playAgain = () => {
+    if (mode === "online" && !onlineManager.isHost) {
+      twoVTwoSession.requestRematch();
+      return;
+    }
     const next = initialize2v2(mode, 0, 0, game.targetScore as ScoreTarget);
     setPending(null);
-    setGame(next);
-    if (mode === "online" && onlineManager.isHost) onlineManager.send({ type: "2v2-state", payload: next });
-    if (mode === "online" && !onlineManager.isHost) onlineManager.send({ type: "2v2-sync" });
+    if (mode === "online" && onlineManager.isHost) {
+      twoVTwoSession.publishHostState({ ...next, seatNames: game.seatNames } as Online2v2State);
+    } else {
+      setGame(next);
+    }
   };
 
   const createRoom = async (chosenTargetScore: ScoreTarget) => {
@@ -441,7 +466,7 @@ export default function Chkoba2v2({
     setOnlinePhase("creating");
     setConsumeMatchOnConnect(true);
     try {
-      const code = await onlineManager.createRoom();
+      const code = await twoVTwoSession.createRoom();
       setRoomCode(code);
       setOnlinePhase("waiting");
     } catch {
@@ -457,7 +482,7 @@ export default function Chkoba2v2({
 
   const confirmQuit = () => {
     setShowQuitConfirm(false);
-    if (mode === "online") onlineManager.destroy();
+    if (mode === "online") twoVTwoSession.destroy();
     setConsumeMatchOnConnect(false);
     onExit();
   };
@@ -476,7 +501,7 @@ export default function Chkoba2v2({
     setOnlinePhase("joining");
     setConsumeMatchOnConnect(true);
     try {
-      await onlineManager.joinRoom(code);
+      await twoVTwoSession.joinRoom(code, playerName);
     } catch {
       setOnlinePhase("error");
       setConsumeMatchOnConnect(false);
@@ -647,7 +672,7 @@ export default function Chkoba2v2({
           className="mt-6 text-green-400 hover:text-white text-sm hover:bg-green-700/50 rounded-lg px-4 py-2 transition-colors"
           onClick={() => {
             feedback("button");
-            if (mode === "online") onlineManager.destroy();
+            if (mode === "online") twoVTwoSession.destroy();
             setConsumeMatchOnConnect(false);
             onExit();
           }}
@@ -710,11 +735,9 @@ export default function Chkoba2v2({
           <div key={s} className="premium-panel p-2 rounded-xl">
             <div className="text-xs mb-2">{seatLabel[s]} {game.currentTurn === s ? "• tour" : ""}</div>
             <div className="stagger-row flex gap-2 justify-center">
-              {game.hands[s].map((c) => (
-                isOnline && !controllableSeats.includes(s)
-                  ? <CardBack key={c.id} />
-                  : <CardComponent key={c.id} card={c} onClick={() => onPlay(s, c)} disabled={game.currentTurn !== s || !controllableSeats.includes(s)} />
-              ))}
+              {isOnline && !controllableSeats.includes(s)
+                ? Array.from({ length: !onlineManager.isHost ? remoteHandCounts[s] : game.hands[s].length }, (_, index) => <CardBack key={index} />)
+                : game.hands[s].map((c) => <CardComponent key={c.id} card={c} onClick={() => onPlay(s, c)} disabled={game.currentTurn !== s || !controllableSeats.includes(s)} />)}
             </div>
           </div>
         ))}
@@ -750,11 +773,9 @@ export default function Chkoba2v2({
           <div key={s} className="premium-panel p-2 rounded-xl">
             <div className="text-xs mb-2">{seatLabel[s]} {game.currentTurn === s ? "• tour" : ""}</div>
             <div className="stagger-row flex gap-2 justify-center">
-              {game.hands[s].map((c) => (
-                isOnline && !controllableSeats.includes(s)
-                  ? <CardBack key={c.id} />
-                  : <CardComponent key={c.id} card={c} onClick={() => onPlay(s, c)} disabled={game.currentTurn !== s || !controllableSeats.includes(s)} />
-              ))}
+              {isOnline && !controllableSeats.includes(s)
+                ? Array.from({ length: !onlineManager.isHost ? remoteHandCounts[s] : game.hands[s].length }, (_, index) => <CardBack key={index} />)
+                : game.hands[s].map((c) => <CardComponent key={c.id} card={c} onClick={() => onPlay(s, c)} disabled={game.currentTurn !== s || !controllableSeats.includes(s)} />)}
             </div>
           </div>
         ))}
