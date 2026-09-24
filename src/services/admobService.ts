@@ -5,10 +5,11 @@ import { admobConfig, getRewardedAdUnitId, isAdmobTestMode } from "../config/adm
 const PRIVACY_STATUS_EVENT = "chkoba:ad-privacy-status";
 let initializationPromise: Promise<boolean> | null = null;
 let privacyOptionsRequired = false;
+let consentStillRequired = false;
 let rewardedLoadPromise: Promise<boolean> | null = null;
 let rewardedReady = false;
 
-export type RewardedAdResult = "rewarded" | "unavailable" | "not-allowed" | "error";
+export type RewardedAdResult = "rewarded" | "unavailable" | "consent-required" | "error";
 
 function isNativeMobilePlatform(): boolean {
   const platform = Capacitor.getPlatform();
@@ -52,7 +53,7 @@ export function initializeAdMob(): Promise<boolean> {
   if (!isNativeMobilePlatform()) return Promise.resolve(false);
   if (initializationPromise) return initializationPromise;
 
-  initializationPromise = (async () => {
+  const attempt = (async () => {
     try {
       await AdMob.initialize({
         initializeForTesting: isAdmobTestMode,
@@ -60,9 +61,12 @@ export function initializeAdMob(): Promise<boolean> {
         tagForChildDirectedTreatment: false,
       });
       let consentInfo = await AdMob.requestConsentInfo();
-      if (!consentInfo.canRequestAds && consentInfo.isConsentFormAvailable && consentInfo.status === AdmobConsentStatus.REQUIRED) {
+      console.log("[AdMob] consent info", consentInfo);
+      if (!consentInfo.canRequestAds && consentInfo.isConsentFormAvailable) {
         consentInfo = await AdMob.showConsentForm();
+        console.log("[AdMob] consent form result", consentInfo);
       }
+      consentStillRequired = !consentInfo.canRequestAds && consentInfo.status === AdmobConsentStatus.REQUIRED;
       publishPrivacyStatus(consentInfo.privacyOptionsRequirementStatus === "REQUIRED");
       if (consentInfo.canRequestAds) {
         try {
@@ -75,10 +79,15 @@ export function initializeAdMob(): Promise<boolean> {
       return consentInfo.canRequestAds;
     } catch (error) {
       console.error("[AdMob] initialization or consent failed", error);
-      publishPrivacyStatus(false);
       return false;
     }
   })();
+
+  initializationPromise = attempt;
+  void attempt.then((canRequestAds) => {
+    // A temporary network/UMP failure must be retryable from the reward button.
+    if (!canRequestAds && initializationPromise === attempt) initializationPromise = null;
+  });
   return initializationPromise;
 }
 
@@ -152,7 +161,7 @@ export async function showRewardedMatchEntryAd(): Promise<RewardedAdResult> {
   if (platform !== "ios" && platform !== "android") return "unavailable";
 
   try {
-    if (!(await initializeAdMob())) return "not-allowed";
+    if (!(await initializeAdMob())) return consentStillRequired ? "consent-required" : "error";
     if (!(await preloadRewardedMatchEntryAd())) return "unavailable";
 
     const result = await presentRewardedAd();

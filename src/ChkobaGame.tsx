@@ -412,8 +412,8 @@ export const ChkobaGame: React.FC = () => {
     try {
       const result = await showRewardedMatchEntryAd();
       if (result !== "rewarded") {
-        const message = result === "not-allowed"
-          ? "Les publicités ne sont pas autorisées par vos choix de confidentialité."
+        const message = result === "consent-required"
+          ? "Votre choix de confidentialité est encore nécessaire. Relancez l'app puis réessayez."
           : result === "unavailable"
             ? "Aucune publicité n'est disponible pour le moment. Réessayez dans quelques instants."
             : "La publicité n'a pas pu être chargée. Vérifiez votre connexion puis réessayez.";

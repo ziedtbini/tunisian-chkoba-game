@@ -42,6 +42,10 @@ https://ziedtbini.github.io/tunisian-chkoba-game/support.html
 
 https://ziedtbini.github.io/tunisian-chkoba-game/privacy-policy.html
 
+## URL marketing / site du développeur
+
+À remplacer par un domaine qui expose `app-ads.txt` à sa racine avant publication.
+
 ## Notes pour la vérification Apple
 
 Chkobba Online est un jeu de cartes tunisien sans création de compte. Le mode en ligne utilise un code de salon généré dans l'application. Pour tester : un appareil crée un salon via « En ligne », puis un second appareil rejoint avec le code affiché. Les publicités récompensées sont facultatives et accordent une partie supplémentaire uniquement après validation de la récompense par le SDK AdMob.
