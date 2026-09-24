@@ -3,11 +3,13 @@ import { createRoot } from "react-dom/client";
 import "./index.css";
 import App from "./App";
 import { crashTest, initFirebase } from "./firebase";
-import { initializeAdMob } from "./services/admobService";
+import { initializeAdMob, preloadRewardedMatchEntryAd } from "./services/admobService";
 
 void (async () => {
   await initFirebase();
-  await initializeAdMob();
+  if (await initializeAdMob()) {
+    void preloadRewardedMatchEntryAd();
+  }
   await crashTest();
 })();
 

@@ -1,10 +1,14 @@
-import { Capacitor } from "@capacitor/core";
-import { AdMob, AdmobConsentStatus, MaxAdContentRating } from "@capacitor-community/admob";
+import { Capacitor, type PluginListenerHandle } from "@capacitor/core";
+import { AdMob, AdmobConsentStatus, MaxAdContentRating, RewardAdPluginEvents } from "@capacitor-community/admob";
 import { admobConfig, getRewardedAdUnitId, isAdmobTestMode } from "../config/admobConfig";
 
 const PRIVACY_STATUS_EVENT = "chkoba:ad-privacy-status";
 let initializationPromise: Promise<boolean> | null = null;
 let privacyOptionsRequired = false;
+let rewardedLoadPromise: Promise<boolean> | null = null;
+let rewardedReady = false;
+
+export type RewardedAdResult = "rewarded" | "unavailable" | "not-allowed" | "error";
 
 function isNativeMobilePlatform(): boolean {
   const platform = Capacitor.getPlatform();
@@ -61,7 +65,12 @@ export function initializeAdMob(): Promise<boolean> {
       }
       publishPrivacyStatus(consentInfo.privacyOptionsRequirementStatus === "REQUIRED");
       if (consentInfo.canRequestAds) {
-        await requestIosTrackingAuthorization();
+        try {
+          await requestIosTrackingAuthorization();
+        } catch (error) {
+          // ATT refusal or restrictions must not block contextual ads.
+          console.warn("[AdMob] tracking authorization unavailable", error);
+        }
       }
       return consentInfo.canRequestAds;
     } catch (error) {
@@ -73,20 +82,88 @@ export function initializeAdMob(): Promise<boolean> {
   return initializationPromise;
 }
 
-export async function showRewardedMatchEntryAd(): Promise<boolean> {
-  const platform = Capacitor.getPlatform();
-  if (platform !== "ios" && platform !== "android") return false;
+function wait(delayMs: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, delayMs));
+}
 
-  try {
+export function preloadRewardedMatchEntryAd(): Promise<boolean> {
+  const platform = Capacitor.getPlatform();
+  if (platform !== "ios" && platform !== "android") return Promise.resolve(false);
+  if (rewardedReady) return Promise.resolve(true);
+  if (rewardedLoadPromise) return rewardedLoadPromise;
+
+  rewardedLoadPromise = (async () => {
     if (!(await initializeAdMob())) return false;
     const rewardedAdUnitId = getRewardedAdUnitId(platform);
     if (!rewardedAdUnitId) return false;
-    await AdMob.prepareRewardVideoAd({ adId: rewardedAdUnitId, isTesting: isAdmobTestMode });
-    const reward = await AdMob.showRewardVideoAd();
-    return reward.amount > 0;
-  } catch (error) {
-    console.error("[AdMob] rewarded ad failed", error);
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        await AdMob.prepareRewardVideoAd({
+          adId: rewardedAdUnitId,
+          isTesting: isAdmobTestMode,
+          npa: true,
+        });
+        rewardedReady = true;
+        return true;
+      } catch (error) {
+        console.warn(`[AdMob] rewarded load attempt ${attempt} failed`, error);
+        if (attempt < 3) await wait(attempt * 1500);
+      }
+    }
     return false;
+  })().finally(() => {
+    rewardedLoadPromise = null;
+  });
+
+  return rewardedLoadPromise;
+}
+
+async function presentRewardedAd(): Promise<RewardedAdResult> {
+  const handles: PluginListenerHandle[] = [];
+
+  return new Promise<RewardedAdResult>(async (resolve) => {
+    let settled = false;
+    const finish = (result: RewardedAdResult) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeoutId);
+      void Promise.allSettled(handles.map((handle) => handle.remove()));
+      resolve(result);
+    };
+    const timeoutId = window.setTimeout(() => finish("error"), 120_000);
+
+    try {
+      handles.push(await AdMob.addListener(RewardAdPluginEvents.Rewarded, () => finish("rewarded")));
+      handles.push(await AdMob.addListener(RewardAdPluginEvents.Dismissed, () => finish("unavailable")));
+      handles.push(await AdMob.addListener(RewardAdPluginEvents.FailedToShow, () => finish("error")));
+      void AdMob.showRewardVideoAd()
+        .then((reward) => finish(Number(reward.amount) > 0 ? "rewarded" : "unavailable"))
+        .catch(() => finish("error"));
+    } catch (error) {
+      console.error("[AdMob] rewarded presentation failed", error);
+      finish("error");
+    }
+  });
+}
+
+export async function showRewardedMatchEntryAd(): Promise<RewardedAdResult> {
+  const platform = Capacitor.getPlatform();
+  if (platform !== "ios" && platform !== "android") return "unavailable";
+
+  try {
+    if (!(await initializeAdMob())) return "not-allowed";
+    if (!(await preloadRewardedMatchEntryAd())) return "unavailable";
+
+    const result = await presentRewardedAd();
+    rewardedReady = false;
+    window.setTimeout(() => void preloadRewardedMatchEntryAd(), 1200);
+    return result;
+  } catch (error) {
+    rewardedReady = false;
+    console.error("[AdMob] rewarded ad failed", error);
+    window.setTimeout(() => void preloadRewardedMatchEntryAd(), 2000);
+    return "error";
   }
 }
 

@@ -410,9 +410,14 @@ export const ChkobaGame: React.FC = () => {
     setMatchEntryError(null);
     setRewardedAdOpen(true);
     try {
-      const rewarded = await showRewardedMatchEntryAd();
-      if (!rewarded) {
-        setMatchEntryError("Publicité indisponible ou récompense non accordée.");
+      const result = await showRewardedMatchEntryAd();
+      if (result !== "rewarded") {
+        const message = result === "not-allowed"
+          ? "Les publicités ne sont pas autorisées par vos choix de confidentialité."
+          : result === "unavailable"
+            ? "Aucune publicité n'est disponible pour le moment. Réessayez dans quelques instants."
+            : "La publicité n'a pas pu être chargée. Vérifiez votre connexion puis réessayez.";
+        setMatchEntryError(message);
         return;
       }
       setAvailableMatches((prev) => prev + 1);

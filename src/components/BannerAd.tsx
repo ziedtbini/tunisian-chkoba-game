@@ -52,8 +52,8 @@ export default function BannerAd({ className }: BannerAdProps) {
     let cancelled = false;
     let loadedListener: PluginListenerHandle | null = null;
     let failedListener: PluginListenerHandle | null = null;
-    let bannerLoaded = false;
-    let bannerFailed = false;
+    let retryTimer: number | null = null;
+    let retryCount = 0;
 
     const platform = Capacitor.getPlatform();
     if (platform !== "ios" && platform !== "android") {
@@ -71,7 +71,7 @@ export default function BannerAd({ className }: BannerAdProps) {
       return;
     }
 
-    const show = async () => {
+    const show = async (useFallbackSize = false) => {
       try {
         if (bannerShowInFlight || bannerIsDisplayed) {
           setIsBannerLoaded(bannerIsDisplayed);
@@ -86,8 +86,7 @@ export default function BannerAd({ className }: BannerAdProps) {
         bannerIsDisplayed = false;
 
         // Register listeners without blocking banner display flow.
-        void AdMob.addListener(BannerAdPluginEvents.Loaded, () => {
-          bannerLoaded = true;
+        if (!loadedListener) void AdMob.addListener(BannerAdPluginEvents.Loaded, () => {
           bannerIsDisplayed = true;
           setIsBannerLoaded(true);
           console.log("[Banner] loaded");
@@ -96,10 +95,17 @@ export default function BannerAd({ className }: BannerAdProps) {
         }).catch((error) => {
           console.log("[AdMob] banner listener(loaded) failed", error);
         });
-        void AdMob.addListener(BannerAdPluginEvents.FailedToLoad, (error) => {
-          bannerFailed = true;
+        if (!failedListener) void AdMob.addListener(BannerAdPluginEvents.FailedToLoad, (error) => {
           setIsBannerLoaded(false);
           console.log("[Banner] failed to load", error);
+          if (!cancelled && retryCount < 3 && retryTimer === null) {
+            retryCount += 1;
+            retryTimer = window.setTimeout(() => {
+              retryTimer = null;
+              bannerShowInFlight = false;
+              void show(true);
+            }, retryCount * 2500);
+          }
         }).then((h) => {
           failedListener = h;
         }).catch((error) => {
@@ -125,33 +131,16 @@ export default function BannerAd({ className }: BannerAdProps) {
           adId: bannerId,
           isTesting: isAdmobTestMode,
           npa: true,
-          adSize: BannerAdSize.ADAPTIVE_BANNER,
-          position,
-          margin,
+          adSize: useFallbackSize ? BannerAdSize.BANNER : BannerAdSize.ADAPTIVE_BANNER,
+          position: useFallbackSize ? BannerAdPosition.BOTTOM_CENTER : position,
+          margin: useFallbackSize ? 16 : margin,
         });
         console.log("[Banner] shown");
-        bannerShowInFlight = false;
-
-        // Fallback retry in case the first placement fails to load.
-        await new Promise<void>((resolve) => window.setTimeout(resolve, 1200));
-        if (cancelled) return;
-        if (!bannerLoaded && bannerFailed) {
-          bannerFailed = false;
-          console.log("[AdMob] banner retry with fallback placement");
-          await AdMob.showBanner({
-            adId: bannerId,
-            isTesting: isAdmobTestMode,
-            npa: true,
-            adSize: BannerAdSize.BANNER,
-            position: BannerAdPosition.BOTTOM_CENTER,
-            margin: 16,
-          });
-          console.log("[Banner] shown");
-        }
       } catch (error) {
-        bannerShowInFlight = false;
         bannerIsDisplayed = false;
         console.log("[Banner] failed to show", error);
+      } finally {
+        bannerShowInFlight = false;
       }
     };
 
@@ -159,6 +148,7 @@ export default function BannerAd({ className }: BannerAdProps) {
 
     return () => {
       cancelled = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
       bannerMountCount = Math.max(0, bannerMountCount - 1);
       void Promise.allSettled([
         loadedListener?.remove(),
