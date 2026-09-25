@@ -84,7 +84,7 @@ export const CardComponent: React.FC<CardComponentProps> = ({
 
   if (faceDown) {
     return (
-      <div className="rounded-lg shadow-lg overflow-hidden flex-shrink-0 select-none" style={{ width: w, height: h }}>
+      <div className={cn("playing-card playing-card--back rounded-lg shadow-lg overflow-hidden flex-shrink-0 select-none", small && "playing-card--small")} style={{ width: w, height: h }}>
         {!broken ? (
           <img
             src={backCandidates[Math.min(backIndex, backCandidates.length - 1)]}
@@ -115,7 +115,8 @@ export const CardComponent: React.FC<CardComponentProps> = ({
     <div
       onClick={disabled ? undefined : onClick}
       className={cn(
-        "rounded-lg shadow-lg overflow-hidden flex-shrink-0 transition-all duration-200 select-none",
+        "playing-card playing-card--face rounded-lg shadow-lg overflow-hidden flex-shrink-0 transition-all duration-200 select-none",
+        small && "playing-card--small",
         !disabled && "cursor-pointer",
         selected && "ring-3 ring-yellow-400 -translate-y-3 scale-110 shadow-yellow-300/50 shadow-xl z-10",
         highlighted && "ring-3 ring-emerald-400 scale-105 shadow-emerald-300/50 shadow-xl z-10",
@@ -154,7 +155,7 @@ export const CardBack: React.FC<{ small?: boolean }> = ({ small = false }) => {
   const [broken, setBroken] = useState(false);
 
   return (
-    <div className="rounded-lg shadow-lg overflow-hidden flex-shrink-0 select-none" style={{ width: w, height: h }}>
+    <div className={cn("playing-card playing-card--back rounded-lg shadow-lg overflow-hidden flex-shrink-0 select-none", small && "playing-card--small")} style={{ width: w, height: h }}>
       {!broken ? (
         <img
           src={backCandidates[Math.min(backIndex, backCandidates.length - 1)]}

@@ -50,11 +50,16 @@ export async function showAdPrivacyOptions(): Promise<void> {
 }
 
 export function initializeAdMob(): Promise<boolean> {
-  if (!isNativeMobilePlatform()) return Promise.resolve(false);
+  const platform = Capacitor.getPlatform();
+  if (!isNativeMobilePlatform()) {
+    console.log(`[AdMob] initialization skipped on platform: ${platform}`);
+    return Promise.resolve(false);
+  }
   if (initializationPromise) return initializationPromise;
 
   const attempt = (async () => {
     try {
+      console.log(`[AdMob] initialization start mode=${admobConfig.mode} platform=${platform}`);
       await AdMob.initialize({
         initializeForTesting: isAdmobTestMode,
         maxAdContentRating: MaxAdContentRating.General,
@@ -76,6 +81,7 @@ export function initializeAdMob(): Promise<boolean> {
           console.warn("[AdMob] tracking authorization unavailable", error);
         }
       }
+      console.log(`[AdMob] initialization complete canRequestAds=${consentInfo.canRequestAds}`);
       return consentInfo.canRequestAds;
     } catch (error) {
       console.error("[AdMob] initialization or consent failed", error);

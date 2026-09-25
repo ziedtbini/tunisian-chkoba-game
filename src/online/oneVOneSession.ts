@@ -3,6 +3,7 @@ import { onlineManager } from "../onlineManager";
 import { apply1v1Capture, apply1v1Play } from "./authority";
 import {
   ONLINE_PROTOCOL_VERSION,
+  RECONNECT_WINDOW_MS,
   createActionId,
   type ClientMessage,
   type Online1v1View,
@@ -13,9 +14,11 @@ import {
 import { HostSessionGuard } from "./session";
 import { create1v1View, shouldAcceptSnapshot } from "./stateView";
 import { isProtocolCompatible, sanitizePlayerName } from "./validation";
+import { computerPlay } from "../gameLogic";
+import { OnlineSessionTelemetry } from "./sessionTelemetry";
 
 const STORAGE_KEY = "chkoba-1v1-v2-session";
-const RESUME_TTL_MS = 5 * 60_000;
+const RESUME_TTL_MS = RECONNECT_WINDOW_MS;
 
 type ResumeData = {
   roomCode: string;
@@ -48,11 +51,12 @@ export type ProtocolTransport = {
     onTransportConnected: () => void;
     onTransportDisconnected: () => void;
     onReconnecting?: (attempt: number) => void;
-    onError?: (message: string) => void;
+    onError?: (message: string, reasonCode?: string) => void;
   }): void;
   createRoom(protocol: "v2"): Promise<string>;
   joinRoom(code: string, protocol: "v2"): Promise<void>;
   sendProtocolMessage(message: OnlineMessage): void;
+  markSessionConnected?(): void;
   destroy(): void;
 };
 
@@ -82,8 +86,11 @@ export class OneVOneOnlineSession {
   private guestStateVersion = -1;
   private initialConnectionCompleted = false;
   private status: OneVOneSessionStatus = "idle";
+  private readonly telemetry: OnlineSessionTelemetry;
 
-  constructor(private readonly transport: ProtocolTransport = onlineManager) {}
+  constructor(private readonly transport: ProtocolTransport = onlineManager) {
+    this.telemetry = new OnlineSessionTelemetry("1v1", () => this.transport.isHost ? "host" : "guest");
+  }
 
   configure(callbacks: OneVOneSessionCallbacks): void {
     this.callbacks = callbacks;
@@ -93,13 +100,17 @@ export class OneVOneOnlineSession {
       onTransportDisconnected: () => {
         this.hostGuard?.disconnect();
         this.status = "reconnecting";
+        this.telemetry.disconnected();
         this.callbacks?.onDisconnected();
       },
       onReconnecting: (attempt) => {
         this.status = "reconnecting";
+        this.telemetry.reconnecting(attempt);
         this.callbacks?.onReconnecting(attempt);
       },
-      onError: (message) => {
+      onError: (message, reasonCode = "transport_error") => {
+        if (this.status === "reconnecting") this.telemetry.reconnectFailed(reasonCode);
+        else this.telemetry.joinFailed(reasonCode);
         this.status = "error";
         this.callbacks?.onError(message);
       },
@@ -110,14 +121,22 @@ export class OneVOneOnlineSession {
     this.resetSession(false);
     this.status = "connecting";
     this.hostGuard = new HostSessionGuard();
-    return this.transport.createRoom("v2");
+    const code = await this.transport.createRoom("v2");
+    this.telemetry.roomCreated();
+    return code;
   }
 
   async joinRoom(code: string, playerName: string): Promise<void> {
     this.resetSession(false);
     this.status = "connecting";
     this.guestName = sanitizePlayerName(playerName, "Joueur 2");
-    await this.transport.joinRoom(code, "v2");
+    this.telemetry.joinStarted();
+    try {
+      await this.transport.joinRoom(code, "v2");
+    } catch (error) {
+      this.telemetry.joinFailed("transport_error");
+      throw error;
+    }
   }
 
   playCard(cardId: string): void {
@@ -152,11 +171,33 @@ export class OneVOneOnlineSession {
 
   requestSync(): void {
     if (!this.matchId || !this.playerToken) return;
+    this.telemetry.syncRequested();
     this.transport.sendProtocolMessage({ type: "SYNC_REQUEST", protocolVersion: ONLINE_PROTOCOL_VERSION, matchId: this.matchId, playerToken: this.playerToken, lastKnownStateVersion: this.guestStateVersion });
   }
 
   requestNextRound(): void { this.sendAction({ type: "REQUEST_NEXT_ROUND", mode: "1v1" }); }
   requestRematch(): void { this.sendAction({ type: "REQUEST_REMATCH", mode: "1v1" }); }
+  forceTimedTurn(): void {
+    if (!this.transport.isHost || !this.hostState || this.hostState.phase !== "playing") return;
+    const state = this.hostState;
+    const side = state.currentTurn;
+    if (state.selectedCard && state.possibleCaptures?.length) {
+      const result = apply1v1Capture(state, side, state.selectedCard.id, state.possibleCaptures[0].map((card) => card.id));
+      if (result.ok) this.commitHostState({ ...result.state, message: `Temps écoulé. ${result.state.message}` });
+      return;
+    }
+    const hand = state[side].hand;
+    if (hand.length === 0) return;
+    const { card, capture } = computerPlay(hand, state.table);
+    const played = apply1v1Play(state, side, card.id);
+    if (!played.ok) return;
+    let next = played.state;
+    if (next.selectedCard && capture) {
+      const captured = apply1v1Capture(next, side, card.id, capture.map((item) => item.id));
+      if (captured.ok) next = captured.state;
+    }
+    this.commitHostState({ ...next, message: `Temps écoulé. ${next.message}` });
+  }
   getHostState(): GameState | null { return this.hostState; }
   getStatus(): OneVOneSessionStatus { return this.status; }
   destroy(): void { this.resetSession(true); this.status = "closed"; this.transport.destroy(); }
@@ -206,7 +247,9 @@ export class OneVOneOnlineSession {
     if (message.type === "REJOIN") {
       const admission = this.hostGuard.rejoin(message.matchId, message.playerToken);
       if (!admission.ok || !this.hostState) {
-        this.transport.sendProtocolMessage({ type: "REJOIN_REJECTED", protocolVersion: ONLINE_PROTOCOL_VERSION, reasonCode: admission.ok ? "REJOIN_DENIED" : admission.reason });
+        const reasonCode = admission.ok ? "REJOIN_DENIED" : admission.reason;
+        this.telemetry.reconnectFailed(reasonCode.toLowerCase());
+        this.transport.sendProtocolMessage({ type: "REJOIN_REJECTED", protocolVersion: ONLINE_PROTOCOL_VERSION, reasonCode });
         return;
       }
       this.transport.sendProtocolMessage({ type: "REJOIN_ACCEPTED", protocolVersion: ONLINE_PROTOCOL_VERSION, matchId: admission.matchId, playerToken: admission.playerToken, stateVersion: this.hostGuard.stateVersion, view: create1v1View(this.hostState, "player2") });
@@ -221,7 +264,7 @@ export class OneVOneOnlineSession {
     if (message.type !== "PLAY_CARD" && message.type !== "CHOOSE_CAPTURE" && message.type !== "REQUEST_NEXT_ROUND" && message.type !== "REQUEST_REMATCH") return;
     const reason = this.hostGuard.authorize(message.matchId, message.playerToken, message.actionId);
     if (reason) {
-      this.transport.sendProtocolMessage({ type: "ACTION_REJECTED", protocolVersion: ONLINE_PROTOCOL_VERSION, reasonCode: reason, actionId: message.actionId });
+      this.rejectAction(message.actionId, reason);
       if (reason === "DUPLICATE_ACTION") this.sendSnapshot();
       return;
     }
@@ -248,11 +291,13 @@ export class OneVOneOnlineSession {
   private receiveAsGuest(message: OnlineMessage): void {
     if (message.type === "WELCOME" || message.type === "REJOIN_ACCEPTED") {
       if (message.view.mode !== "1v1") return;
+      if (message.type === "WELCOME") this.telemetry.joinSuccess();
       this.matchId = message.matchId;
       this.playerToken = message.playerToken;
       this.guestStateVersion = message.stateVersion;
       this.persist();
       this.callbacks?.onGuestView(message.view);
+      this.telemetry.observePhase(message.view.phase);
       this.sessionReady(message.type === "REJOIN_ACCEPTED");
       return;
     }
@@ -261,9 +306,18 @@ export class OneVOneOnlineSession {
       this.guestStateVersion = message.stateVersion;
       this.persist();
       this.callbacks?.onGuestView(message.view);
-    } else if (message.type === "ROOM_FULL") this.callbacks?.onError("Cette partie a deja deux joueurs.");
-    else if (message.type === "VERSION_MISMATCH") this.callbacks?.onError("Les deux appareils doivent utiliser la meme version de CHKOBBA.");
-    else if (message.type === "REJOIN_REJECTED") { localStorage.removeItem(STORAGE_KEY); this.callbacks?.onError("Impossible de reprendre la partie."); }
+      this.telemetry.observePhase(message.view.phase);
+    } else if (message.type === "ROOM_FULL") {
+      this.telemetry.joinFailed("room_full", "session_handshake");
+      this.callbacks?.onError("Cette partie a deja deux joueurs.");
+    } else if (message.type === "VERSION_MISMATCH") {
+      this.telemetry.joinFailed("version_mismatch", "session_handshake");
+      this.callbacks?.onError("Les deux appareils doivent utiliser la meme version de CHKOBBA.");
+    } else if (message.type === "REJOIN_REJECTED") {
+      this.telemetry.reconnectFailed(message.reasonCode.toLowerCase());
+      localStorage.removeItem(STORAGE_KEY);
+      this.callbacks?.onError("Impossible de reprendre la partie.");
+    }
   }
 
   private sendAction(action: { type: "PLAY_CARD"; cardId: string } | { type: "CHOOSE_CAPTURE"; cardId: string; captureIds: string[] } | { type: "REQUEST_NEXT_ROUND"; mode: "1v1" } | { type: "REQUEST_REMATCH"; mode: "1v1" }): void {
@@ -273,6 +327,7 @@ export class OneVOneOnlineSession {
 
   private commitHostState(state: GameState, notify = true): void {
     this.hostState = state;
+    this.telemetry.observePhase(state.phase);
     this.hostGuard?.nextVersion();
     if (notify) this.callbacks?.onHostState(state);
     this.sendSnapshot();
@@ -285,6 +340,7 @@ export class OneVOneOnlineSession {
   }
 
   private rejectAction(actionId: string, reasonCode: RejectReason): void {
+    this.telemetry.actionRejected(reasonCode);
     this.transport.sendProtocolMessage({
       type: "ACTION_REJECTED",
       protocolVersion: ONLINE_PROTOCOL_VERSION,
@@ -297,6 +353,8 @@ export class OneVOneOnlineSession {
     if (!reconnected && this.initialConnectionCompleted) return;
     this.initialConnectionCompleted = true;
     this.status = "connected";
+    this.transport.markSessionConnected?.();
+    this.telemetry.connected(reconnected);
     this.callbacks?.onSessionConnected(reconnected);
   }
 
@@ -307,6 +365,7 @@ export class OneVOneOnlineSession {
   private resetSession(clearStorage: boolean): void {
     this.hostGuard?.close(); this.hostGuard = null; this.hostState = null; this.matchId = ""; this.playerToken = ""; this.guestStateVersion = -1; this.initialConnectionCompleted = false;
     this.status = "idle";
+    this.telemetry.reset();
     if (clearStorage) localStorage.removeItem(STORAGE_KEY);
   }
 }

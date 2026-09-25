@@ -1,5 +1,5 @@
 import { ActionDeduplicator } from "./authority";
-import { createSecureId, type RejectReason } from "./protocol";
+import { createSecureId, RECONNECT_WINDOW_MS, type RejectReason } from "./protocol";
 
 export type SessionAdmission =
   | { ok: true; matchId: string; playerToken: string; reconnect: boolean }
@@ -22,7 +22,7 @@ export class HostSessionGuard {
 
   disconnect(now = Date.now()): void { this.occupied = false; this.disconnectedAt = now; }
 
-  rejoin(matchId: string, token: string, now = Date.now(), windowMs = 60_000): SessionAdmission {
+  rejoin(matchId: string, token: string, now = Date.now(), windowMs = RECONNECT_WINDOW_MS): SessionAdmission {
     if (matchId !== this.matchId || token !== this.playerToken) return { ok: false, reason: "REJOIN_DENIED" };
     if (this.disconnectedAt !== null && now - this.disconnectedAt > windowMs) return { ok: false, reason: "SESSION_EXPIRED" };
     this.occupied = true;

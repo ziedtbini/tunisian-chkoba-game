@@ -92,6 +92,10 @@ describe("2v2 v2 session", () => {
     hostTransport.disconnect(); guestTransport.reconnect();
     expect(hostTransport.sent.some((message) => message.type === "REJOIN_ACCEPTED")).toBe(true);
     expect(hostCharges).toBe(1); expect(guestCharges).toBe(1);
+
+    hostTransport.disconnect(); guestTransport.reconnect();
+    expect(hostTransport.sent.filter((message) => message.type === "REJOIN_ACCEPTED")).toHaveLength(2);
+    expect(hostCharges).toBe(1); expect(guestCharges).toBe(1);
   });
 
   test("guest cannot play host seats and duplicate actions do not mutate twice", async () => {
@@ -111,5 +115,22 @@ describe("2v2 v2 session", () => {
     hostTransport.callbacks?.onMessage(valid);
     expect(host.getHostState()?.teamB.captured.length).toBe(capturedCount);
     expect(hostTransport.sent.at(-2)).toMatchObject({ type: "ACTION_REJECTED", reasonCode: "DUPLICATE_ACTION" });
+  });
+
+  test("host timeout resolves the current seat with one authoritative snapshot", async () => {
+    const { host, guest, hostTransport } = pair();
+    host.configure(callbacks());
+    guest.configure(callbacks());
+    await host.createRoom();
+    await guest.joinRoom("TEAM2", "Guest");
+
+    host.forceTimedTurn();
+
+    const next = host.getHostState();
+    expect(next?.currentTurn).toBe("p3");
+    expect(next?.hands.p2).toHaveLength(0);
+    expect(next?.teamB.captured.length).toBeGreaterThan(0);
+    expect(next?.message).toContain("Temps écoulé");
+    expect(hostTransport.sent.at(-1)).toMatchObject({ type: "STATE_SNAPSHOT", stateVersion: 1 });
   });
 });

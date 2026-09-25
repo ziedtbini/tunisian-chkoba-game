@@ -2,20 +2,24 @@ import { onlineManager } from "../onlineManager";
 import { apply2v2Action } from "./authority";
 import {
   ONLINE_PROTOCOL_VERSION,
+  RECONNECT_WINDOW_MS,
   createActionId,
   type Online2v2View,
   type OnlineMessage,
   type RejectReason,
   type Seat,
+  type Team,
   type ServerMessage,
 } from "./protocol";
 import { HostSessionGuard } from "./session";
 import { create2v2View, shouldAcceptSnapshot, type Authoritative2v2State } from "./stateView";
 import { isProtocolCompatible, sanitizePlayerName } from "./validation";
 import type { ProtocolTransport, OneVOneSessionStatus as SessionStatus } from "./oneVOneSession";
+import { computerPlay } from "../gameLogic";
+import { OnlineSessionTelemetry } from "./sessionTelemetry";
 
 const STORAGE_KEY = "chkoba-2v2-v2-session";
-const RESUME_TTL_MS = 5 * 60_000;
+const RESUME_TTL_MS = RECONNECT_WINDOW_MS;
 type ResumeData = { roomCode: string; matchId: string; playerToken: string; protocolVersion: number; timestamp: number; mode: "2v2" };
 export type Online2v2State = Authoritative2v2State & { mode: "online" };
 
@@ -59,36 +63,67 @@ export class TwoVTwoOnlineSession {
   private guestStateVersion = -1;
   private initialConnectionCompleted = false;
   private status: SessionStatus = "idle";
+  private readonly telemetry: OnlineSessionTelemetry;
 
-  constructor(private readonly transport: ProtocolTransport = onlineManager) {}
+  constructor(private readonly transport: ProtocolTransport = onlineManager) {
+    this.telemetry = new OnlineSessionTelemetry("2v2", () => this.transport.isHost ? "host" : "guest");
+  }
 
   configure(callbacks: TwoVTwoSessionCallbacks): void {
     this.callbacks = callbacks;
     this.transport.setProtocolCallbacks({
       onMessage: (message) => this.receive(message),
       onTransportConnected: () => this.transportConnected(),
-      onTransportDisconnected: () => { this.hostGuard?.disconnect(); this.status = "reconnecting"; this.callbacks?.onDisconnected(); },
-      onReconnecting: (attempt) => { this.status = "reconnecting"; this.callbacks?.onReconnecting(attempt); },
-      onError: (message) => { this.status = "error"; this.callbacks?.onError(message); },
+      onTransportDisconnected: () => {
+        this.hostGuard?.disconnect(); this.status = "reconnecting"; this.telemetry.disconnected(); this.callbacks?.onDisconnected();
+      },
+      onReconnecting: (attempt) => {
+        this.status = "reconnecting"; this.telemetry.reconnecting(attempt); this.callbacks?.onReconnecting(attempt);
+      },
+      onError: (message, reasonCode = "transport_error") => {
+        if (this.status === "reconnecting") this.telemetry.reconnectFailed(reasonCode);
+        else this.telemetry.joinFailed(reasonCode);
+        this.status = "error"; this.callbacks?.onError(message);
+      },
     });
   }
 
   async createRoom(): Promise<string> {
     this.reset(false); this.status = "connecting"; this.hostGuard = new HostSessionGuard();
-    return this.transport.createRoom("v2");
+    const code = await this.transport.createRoom("v2");
+    this.telemetry.roomCreated();
+    return code;
   }
 
   async joinRoom(code: string, playerName: string): Promise<void> {
     this.reset(false); this.status = "connecting"; this.playerName = sanitizePlayerName(playerName, "Joueur 2");
-    await this.transport.joinRoom(code, "v2");
+    this.telemetry.joinStarted();
+    try {
+      await this.transport.joinRoom(code, "v2");
+    } catch (error) {
+      this.telemetry.joinFailed("transport_error");
+      throw error;
+    }
   }
 
   playCard(seat: Seat, cardId: string): void { this.act("PLAY_CARD", seat, cardId, null); }
   chooseCapture(seat: Seat, cardId: string, captureIds: string[]): void { this.act("CHOOSE_CAPTURE", seat, cardId, captureIds); }
   requestNextRound(): void { this.sendRequest("REQUEST_NEXT_ROUND"); }
   requestRematch(): void { this.sendRequest("REQUEST_REMATCH"); }
+  forceTimedTurn(): void {
+    if (!this.transport.isHost || !this.hostState || this.hostState.phase !== "playing") return;
+    const state = this.hostState;
+    const seat = state.currentTurn;
+    const hand = state.hands[seat];
+    if (hand.length === 0) return;
+    const { card, capture } = computerPlay(hand, state.table);
+    const team: Team = seat === "p1" || seat === "p3" ? "A" : "B";
+    const result = apply2v2Action(state, team, seat, card.id, capture?.map((item) => item.id) ?? null);
+    if (result.ok) this.commit({ ...result.state, mode: "online", message: `Temps écoulé. ${result.state.message}` });
+  }
   requestSync(): void {
     if (!this.matchId || !this.playerToken) return;
+    this.telemetry.syncRequested();
     this.transport.sendProtocolMessage({ type: "SYNC_REQUEST", protocolVersion: ONLINE_PROTOCOL_VERSION, matchId: this.matchId, playerToken: this.playerToken, lastKnownStateVersion: this.guestStateVersion });
   }
   publishHostState(state: Online2v2State): void { if (this.transport.isHost) this.commit(state); }
@@ -132,7 +167,9 @@ export class TwoVTwoOnlineSession {
       if (message.mode !== "2v2") return;
       const admission = this.hostGuard.rejoin(message.matchId, message.playerToken);
       if (!admission.ok || !this.hostState) {
-        this.transport.sendProtocolMessage({ type: "REJOIN_REJECTED", protocolVersion: ONLINE_PROTOCOL_VERSION, reasonCode: admission.ok ? "REJOIN_DENIED" : admission.reason }); return;
+        const reasonCode = admission.ok ? "REJOIN_DENIED" : admission.reason;
+        this.telemetry.reconnectFailed(reasonCode.toLowerCase());
+        this.transport.sendProtocolMessage({ type: "REJOIN_REJECTED", protocolVersion: ONLINE_PROTOCOL_VERSION, reasonCode }); return;
       }
       this.transport.sendProtocolMessage({ type: "REJOIN_ACCEPTED", protocolVersion: ONLINE_PROTOCOL_VERSION, matchId: admission.matchId, playerToken: admission.playerToken, stateVersion: this.hostGuard.stateVersion, view: create2v2View(this.hostState, "B") });
       this.sessionReady(true); return;
@@ -161,15 +198,23 @@ export class TwoVTwoOnlineSession {
   private receiveAsGuest(message: OnlineMessage): void {
     if (message.type === "WELCOME" || message.type === "REJOIN_ACCEPTED") {
       if (message.view.mode !== "2v2") return;
+      if (message.type === "WELCOME") this.telemetry.joinSuccess();
       this.matchId = message.matchId; this.playerToken = message.playerToken; this.guestStateVersion = message.stateVersion;
-      this.persist(); this.callbacks?.onGuestView(message.view); this.sessionReady(message.type === "REJOIN_ACCEPTED"); return;
+      this.persist(); this.callbacks?.onGuestView(message.view); this.telemetry.observePhase(message.view.phase); this.sessionReady(message.type === "REJOIN_ACCEPTED"); return;
     }
     if (message.type === "STATE_SNAPSHOT") {
       if (message.matchId !== this.matchId || message.view.mode !== "2v2" || !shouldAcceptSnapshot(this.guestStateVersion, message.stateVersion)) return;
-      this.guestStateVersion = message.stateVersion; this.persist(); this.callbacks?.onGuestView(message.view);
-    } else if (message.type === "ROOM_FULL") this.callbacks?.onError("Cette partie a deja deux equipes.");
-    else if (message.type === "VERSION_MISMATCH") this.callbacks?.onError("Les deux appareils doivent utiliser la meme version de CHKOBBA.");
-    else if (message.type === "REJOIN_REJECTED") { localStorage.removeItem(STORAGE_KEY); this.callbacks?.onError("Impossible de reprendre la partie."); }
+      this.guestStateVersion = message.stateVersion; this.persist(); this.callbacks?.onGuestView(message.view); this.telemetry.observePhase(message.view.phase);
+    } else if (message.type === "ROOM_FULL") {
+      this.telemetry.joinFailed("room_full", "session_handshake");
+      this.callbacks?.onError("Cette partie a deja deux equipes.");
+    } else if (message.type === "VERSION_MISMATCH") {
+      this.telemetry.joinFailed("version_mismatch", "session_handshake");
+      this.callbacks?.onError("Les deux appareils doivent utiliser la meme version de CHKOBBA.");
+    } else if (message.type === "REJOIN_REJECTED") {
+      this.telemetry.reconnectFailed(message.reasonCode.toLowerCase());
+      localStorage.removeItem(STORAGE_KEY); this.callbacks?.onError("Impossible de reprendre la partie.");
+    }
   }
 
   private act(type: "PLAY_CARD" | "CHOOSE_CAPTURE", seat: Seat, cardId: string, captureIds: string[] | null): void {
@@ -188,17 +233,28 @@ export class TwoVTwoOnlineSession {
     if (!this.matchId || !this.playerToken) return;
     this.transport.sendProtocolMessage({ type, protocolVersion: ONLINE_PROTOCOL_VERSION, mode: "2v2", matchId: this.matchId, playerToken: this.playerToken, actionId: createActionId() });
   }
-  private commit(state: Online2v2State): void { this.hostState = state; this.hostGuard?.nextVersion(); this.callbacks?.onHostState(state); this.sendSnapshot(); }
+  private commit(state: Online2v2State): void { this.hostState = state; this.telemetry.observePhase(state.phase); this.hostGuard?.nextVersion(); this.callbacks?.onHostState(state); this.sendSnapshot(); }
   private sendSnapshot(): void {
     if (!this.hostGuard || !this.hostState) return;
     const message: ServerMessage = { type: "STATE_SNAPSHOT", protocolVersion: ONLINE_PROTOCOL_VERSION, matchId: this.hostGuard.matchId, stateVersion: this.hostGuard.stateVersion, view: create2v2View(this.hostState, "B") };
     this.transport.sendProtocolMessage(message);
   }
-  private reject(actionId: string, reasonCode: RejectReason): void { this.transport.sendProtocolMessage({ type: "ACTION_REJECTED", protocolVersion: ONLINE_PROTOCOL_VERSION, actionId, reasonCode }); }
-  private sessionReady(reconnected: boolean): void { if (!reconnected && this.initialConnectionCompleted) return; this.initialConnectionCompleted = true; this.status = "connected"; this.callbacks?.onSessionConnected(reconnected); }
+  private reject(actionId: string, reasonCode: RejectReason): void {
+    this.telemetry.actionRejected(reasonCode);
+    this.transport.sendProtocolMessage({ type: "ACTION_REJECTED", protocolVersion: ONLINE_PROTOCOL_VERSION, actionId, reasonCode });
+  }
+  private sessionReady(reconnected: boolean): void {
+    if (!reconnected && this.initialConnectionCompleted) return;
+    this.initialConnectionCompleted = true;
+    this.status = "connected";
+    this.transport.markSessionConnected?.();
+    this.telemetry.connected(reconnected);
+    this.callbacks?.onSessionConnected(reconnected);
+  }
   private persist(): void { localStorage.setItem(STORAGE_KEY, JSON.stringify({ roomCode: this.transport.roomCode, matchId: this.matchId, playerToken: this.playerToken, protocolVersion: ONLINE_PROTOCOL_VERSION, timestamp: Date.now(), mode: "2v2" } satisfies ResumeData)); }
   private reset(clearStorage: boolean): void {
     this.hostGuard?.close(); this.hostGuard = null; this.hostState = null; this.matchId = ""; this.playerToken = ""; this.guestStateVersion = -1; this.initialConnectionCompleted = false; this.status = "idle";
+    this.telemetry.reset();
     if (clearStorage) localStorage.removeItem(STORAGE_KEY);
   }
 }

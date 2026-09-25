@@ -24,6 +24,9 @@ import { DEFAULT_MATCH_ENTRIES, loadMatchEntries, saveMatchEntries } from './gam
 import { showRewardedMatchEntryAd } from './services/admobService';
 import { oneVOneSession } from './online/oneVOneSession';
 import type { Online1v1View } from './online/protocol';
+import TurnTimer from './components/TurnTimer';
+import { BackButton, MenuActionCard, NonGameHero, NonGameScreen, ScoreChoiceModal } from './components/NonGameUI';
+import UiIcon from './components/UiIcon';
 
 type VisualTheme = 'classic' | 'gold' | 'royal';
 type ScoreTarget = 11 | 21;
@@ -65,6 +68,7 @@ export const ChkobaGame: React.FC = () => {
   const [scoreFx, setScoreFx] = useState({ p1: false, p2: false });
   const prevScoreRef = useRef<{ p1: number; p2: number } | null>(null);
   const timerRef = useRef<number | null>(null);
+  const onlineResumeTimerRef = useRef<number | null>(null);
   const gameRef = useRef<GameState | null>(null);
 
   // Online state
@@ -166,11 +170,11 @@ export const ChkobaGame: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    // Banner must only exist on home screen.
-    if (game || showOnlineLobby || mode2v2) {
+    // Gameplay owns the full viewport; ads stay limited to menus and lobbies.
+    if (game?.phase === 'playing') {
       void hideBannerAd();
     }
-  }, [game, showOnlineLobby, mode2v2]);
+  }, [game?.phase]);
 
   useEffect(() => {
     localStorage.setItem('chkoba-theme', visualTheme);
@@ -260,21 +264,37 @@ export const ChkobaGame: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    const resume = () => {
-      if (!showOnlineLobby && game?.mode !== 'online' && !mode2v2) return;
-      onlineManager.reconnectSignalling();
-      if (onlineManager.isConnected() && !onlineManager.isHost && !mode2v2) {
-        oneVOneSession.requestSync();
+    const cancelResume = () => {
+      if (onlineResumeTimerRef.current !== null) {
+        window.clearTimeout(onlineResumeTimerRef.current);
+        onlineResumeTimerRef.current = null;
       }
     };
-    window.addEventListener('online', resume);
-    document.addEventListener('visibilitychange', resume);
+    const scheduleResume = () => {
+      if (!showOnlineLobby && game?.mode !== 'online' && !mode2v2) return;
+      if (document.visibilityState === 'hidden' || onlineResumeTimerRef.current !== null) return;
+      onlineResumeTimerRef.current = window.setTimeout(() => {
+        onlineResumeTimerRef.current = null;
+        onlineManager.resumeConnection();
+        if (onlineManager.isConnected() && !onlineManager.isHost && !mode2v2) oneVOneSession.requestSync();
+      }, 150);
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') scheduleResume();
+      else cancelResume();
+    };
+    window.addEventListener('online', scheduleResume);
+    window.addEventListener('offline', cancelResume);
+    document.addEventListener('visibilitychange', onVisibilityChange);
     const appStateListener = CapacitorApp.addListener('appStateChange', ({ isActive }) => {
-      if (isActive) resume();
+      if (isActive) scheduleResume();
+      else cancelResume();
     });
     return () => {
-      window.removeEventListener('online', resume);
-      document.removeEventListener('visibilitychange', resume);
+      cancelResume();
+      window.removeEventListener('online', scheduleResume);
+      window.removeEventListener('offline', cancelResume);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
       void appStateListener.then((listener) => listener.remove());
     };
   }, [showOnlineLobby, game?.mode, mode2v2]);
@@ -308,7 +328,7 @@ export const ChkobaGame: React.FC = () => {
     unlock('first_online');
     const normalizedCode = onlineManager.normalizeRoomCode(joinCode);
     if (normalizedCode.length !== ROOM_CODE_LENGTH) {
-      setOnlineError(`Entrez un code de room de ${ROOM_CODE_LENGTH} caracteres`);
+      setOnlineError(`Le code du salon doit contenir ${ROOM_CODE_LENGTH} caractères.`);
       return;
     }
     setOnlineError('');
@@ -492,6 +512,45 @@ export const ChkobaGame: React.FC = () => {
       showChkoba: isChkoba ? who : null,
     };
   }
+
+  const handleTurnExpired = () => {
+    const current = gameRef.current;
+    if (!current || current.phase !== 'playing' || busy) return;
+    if (current.mode === 'online') {
+      if (onlineManager.isHost) oneVOneSession.forceTimedTurn();
+      return;
+    }
+    if (current.mode === 'vs-cpu' && current.currentTurn === 'player2') return;
+
+    setGame((prev) => {
+      if (!prev || prev.phase !== 'playing') return prev;
+      const who = prev.currentTurn;
+      if (prev.selectedCard && prev.possibleCaptures?.length) {
+        const next = doCapture(prev, prev.selectedCard, prev.possibleCaptures[0], who);
+        return { ...next, message: `Temps écoulé. ${next.message}` };
+      }
+      const hand = prev[who].hand;
+      if (hand.length === 0) return prev;
+      const { card, capture } = computerPlay(hand, prev.table);
+      if (capture) {
+        const next = doCapture(prev, card, capture, who);
+        return { ...next, message: `Temps écoulé. ${next.message}` };
+      }
+      const nextTurn = otherSide(who);
+      return {
+        ...prev,
+        [who]: { ...prev[who], hand: hand.filter((item) => item.id !== card.id) },
+        table: [...prev.table, card],
+        selectedCard: null,
+        possibleCaptures: null,
+        currentTurn: nextTurn,
+        phase: prev.mode === 'vs-player' ? 'turnTransition' : 'playing',
+        message: `Temps écoulé. ${prev[who].name} pose automatiquement ${cardName(card)}.`,
+        lastAction: 'timeout-drop',
+        showChkoba: null,
+      };
+    });
+  };
 
   const confirmTurnTransition = () => {
     setGame(prev => {
@@ -711,28 +770,31 @@ export const ChkobaGame: React.FC = () => {
   // Online lobby
   if (showOnlineLobby && (!game || onlinePhase !== 'connected')) {
     return (
-      <OnlineLobbyScreen
-        onlinePhase={onlinePhase}
-        roomCode={roomCode}
-        joinCode={joinCode}
-        onlineError={onlineError}
-        playerName={playerName}
-        copied={copied}
-        availableMatches={availableMatches}
-        showNotEnoughMatchEntries={showNotEnoughMatchEntries}
-        onShowNotEnoughMatchEntries={() => setShowNotEnoughMatchEntries(true)}
-        onDismissNotEnoughMatchEntries={() => setShowNotEnoughMatchEntries(false)}
-        onSetPlayerName={setPlayerName}
-        onSetJoinCode={setJoinCode}
-        onCreateRoom={createOnlineRoom}
-        onJoinRoom={joinOnlineRoom}
-        onCopyCode={copyRoomCode}
-        onAddMatchEntry={handleAddMatchEntry}
-        rewardedAdOpen={rewardedAdOpen}
-        matchEntryToast={matchEntryToast}
-        matchEntryError={matchEntryError}
-        onBack={leaveOnline}
-      />
+      <>
+        <OnlineLobbyScreen
+          onlinePhase={onlinePhase}
+          roomCode={roomCode}
+          joinCode={joinCode}
+          onlineError={onlineError}
+          playerName={playerName}
+          copied={copied}
+          availableMatches={availableMatches}
+          showNotEnoughMatchEntries={showNotEnoughMatchEntries}
+          onShowNotEnoughMatchEntries={() => setShowNotEnoughMatchEntries(true)}
+          onDismissNotEnoughMatchEntries={() => setShowNotEnoughMatchEntries(false)}
+          onSetPlayerName={setPlayerName}
+          onSetJoinCode={setJoinCode}
+          onCreateRoom={createOnlineRoom}
+          onJoinRoom={joinOnlineRoom}
+          onCopyCode={copyRoomCode}
+          onAddMatchEntry={handleAddMatchEntry}
+          rewardedAdOpen={rewardedAdOpen}
+          matchEntryToast={matchEntryToast}
+          matchEntryError={matchEntryError}
+          onBack={leaveOnline}
+        />
+        <BannerAd />
+      </>
     );
   }
 
@@ -865,19 +927,23 @@ export const ChkobaGame: React.FC = () => {
   const isMyTurn = isOnline ? game.currentTurn === mySide : undefined;
   const p1HeaderLabel = isOnline ? (game.player1.name || 'Joueur 1') : (isCpuMode ? 'Vous' : 'J1');
   const p2HeaderLabel = isOnline ? (game.player2.name || 'Joueur 2') : (isCpuMode ? 'PC' : 'J2');
+  const turnTimerKey = `${game.currentTurn}:${game.player1.hand.length}:${game.player2.hand.length}:${game.player1.captured.length}:${game.player2.captured.length}:${game.table.map((card) => card.id).join(',')}`;
+  const timerActive = game.phase === 'playing' && !busy && !game.showChkoba && (!isOnline || onlinePhase === 'connected');
+  const timerIsAuthoritative = !isOnline || onlineManager.isHost;
 
   return (
     <div className="premium-screen safe-area premium-entrance gameplay-screen text-white select-none">
+      <div className="game-mosaic-rail game-mosaic-rail--left" aria-hidden="true" />
+      <div className="game-mosaic-rail game-mosaic-rail--right" aria-hidden="true" />
+      <div className="game-cafe-cup" aria-hidden="true" />
+      <div className="game-brass-charm" aria-hidden="true">◆</div>
       {/* Chkoba overlay */}
       {game.showChkoba && (
         <div className="fixed inset-0 z-50 flex items-center justify-center pointer-events-none">
-          <div className="animate-bounce">
-            <div className={cn(
-              "text-4xl md:text-6xl font-black px-8 py-4 rounded-2xl shadow-2xl border-2",
-              "bg-gradient-to-r from-amber-400 to-yellow-500 text-amber-900 border-amber-300"
-            )}>
-              ♠ CHKOBA! ♥ 🎉
-            </div>
+          <div className="chkoba-celebration">
+            <span>♠ ◆ ♥</span>
+            <strong>CHKOBA</strong>
+            <small>Prise parfaite</small>
           </div>
         </div>
       )}
@@ -913,6 +979,12 @@ export const ChkobaGame: React.FC = () => {
               <span className={cn("font-bold text-red-300 inline-block", scoreFx.p2 && "score-pop")}>{game.player2Score}</span>
             </div>
           </div>
+          <TurnTimer
+            compact
+            turnKey={turnTimerKey}
+            active={timerActive}
+            onExpire={timerIsAuthoritative ? handleTurnExpired : undefined}
+          />
           <button
             onClick={requestQuitGame}
             className="text-green-400 hover:text-white text-xs hover:bg-green-700/50 rounded px-2 py-1 transition-colors shrink-0"
@@ -935,7 +1007,7 @@ export const ChkobaGame: React.FC = () => {
       )}
 
       {/* Top player area */}
-      <section className="game-player-zone game-player-zone--opponent px-4 py-2">
+      <section className={cn("game-player-zone game-player-zone--opponent px-4 py-2", game.currentTurn === topSide && "game-player-zone--active")}>
         <div className="game-player-meta flex items-center gap-2 mb-1">
           <span className="text-sm text-green-300">
             {isOnline ? '🌐 ' : ''}{topLabel}
@@ -1050,7 +1122,7 @@ export const ChkobaGame: React.FC = () => {
       </div>
 
       {/* Bottom player area (Me) */}
-      <section className="game-player-zone game-player-zone--local px-4 py-3">
+      <section className={cn("game-player-zone game-player-zone--local px-4 py-3", game.currentTurn === bottomSide && "game-player-zone--active")}>
         <div className="game-player-meta flex items-center gap-2 mb-1">
           <span className="text-sm text-amber-300">
             {isOnline ? '👤 ' : '👤 '}{bottomLabel}
@@ -1145,12 +1217,6 @@ const MenuScreenContent: React.FC<{
 }> = ({ onStart, onStart2v2Online, onAddMatchEntry, rewardedAdOpen, matchEntryToast, matchEntryError, visualTheme, availableMatches, onSetTheme, showOnboarding, onCloseOnboarding, unlocked }) => {
   const [menuScreen, setMenuScreen] = useState<'home' | 'online' | 'classic' | 'themes' | 'rules' | 'settings'>('home');
 
-  useEffect(() => {
-    if (menuScreen !== 'home') {
-      void hideBannerAd();
-    }
-  }, [menuScreen]);
-
   const launchOnline1v1 = () => {
     onStart('online', 11);
   };
@@ -1173,61 +1239,74 @@ const MenuScreenContent: React.FC<{
 
   if (menuScreen === 'online') {
     return (
-      <OnlineMenuScreen
-        onBack={() => setMenuScreen('home')}
-        onPlay1v1={launchOnline1v1}
-        onPlay2v2={launchOnline2v2}
-      />
+      <>
+        <OnlineMenuScreen
+          onBack={() => setMenuScreen('home')}
+          onPlay1v1={launchOnline1v1}
+          onPlay2v2={launchOnline2v2}
+        />
+        <BannerAd />
+      </>
     );
   }
 
   if (menuScreen === 'classic') {
     return (
-      <ClassicMenuScreen
-        onBack={() => setMenuScreen('home')}
-        onPlaySolo={launchClassicVsCpu}
-        onPlayLocal={launchClassicVsLocal}
-      />
+      <>
+        <ClassicMenuScreen
+          onBack={() => setMenuScreen('home')}
+          onPlaySolo={launchClassicVsCpu}
+          onPlayLocal={launchClassicVsLocal}
+        />
+        <BannerAd />
+      </>
     );
   }
 
   if (menuScreen === 'themes') {
     return (
-      <ThemesScreen
-        visualTheme={visualTheme}
-        onSetTheme={onSetTheme}
-        onBack={() => setMenuScreen('home')}
-      />
+      <>
+        <ThemesScreen
+          visualTheme={visualTheme}
+          onSetTheme={onSetTheme}
+          onBack={() => setMenuScreen('home')}
+        />
+        <BannerAd />
+      </>
     );
   }
 
   if (menuScreen === 'rules') {
-    return <RulesScreen onBack={() => setMenuScreen('home')} />;
+    return <><RulesScreen onBack={() => setMenuScreen('home')} /><BannerAd /></>;
   }
 
   if (menuScreen === 'settings') {
     return (
-      <SettingsScreen
-        unlocked={unlocked}
-        onBack={() => setMenuScreen('home')}
-      />
+      <>
+        <SettingsScreen
+          unlocked={unlocked}
+          onBack={() => setMenuScreen('home')}
+        />
+        <BannerAd />
+      </>
     );
   }
 
   return (
-    <div className="premium-screen premium-scroll safe-area premium-entrance min-h-screen text-white px-5 py-6">
+    <NonGameScreen className="home-menu-screen premium-entrance" contentClassName="home-menu-content">
       {showOnboarding && (
-        <div className="fixed inset-0 z-[60] bg-black/60 backdrop-blur-sm flex items-center justify-center p-6">
-          <div className="premium-panel rounded-2xl max-w-md w-full p-6">
-            <h3 className="premium-title text-2xl font-black text-amber-200 mb-3">Bienvenue a Chkoba Premium</h3>
+        <div className="non-game-modal-backdrop z-[60]">
+          <div className="non-game-modal max-w-md">
+            <p className="non-game-kicker">Ahlan wa sahlan</p>
+            <h3 className="non-game-modal__title">Bienvenue dans Chkoba</h3>
             <div className="space-y-3 text-sm text-green-100/90">
-              <div className="premium-chip rounded-xl p-3">🎯 Jouez en solo, 1v1 local, en ligne, et 2v2 online.</div>
-              <div className="premium-chip rounded-xl p-3">✨ Choisissez un theme visuel: classic, gold, royal.</div>
-              <div className="premium-chip rounded-xl p-3">🔊 Feedback sonore + haptique pour chaque action cle.</div>
+              <div className="onboarding-feature"><span>♠</span> Jouez en solo, en local ou avec vos amis à distance.</div>
+              <div className="onboarding-feature"><span>✦</span> Choisissez un univers visuel classique, doré ou royal.</div>
+              <div className="onboarding-feature"><span>♪</span> Profitez des sons et retours tactiles à chaque action clé.</div>
             </div>
             <button
               onClick={onCloseOnboarding}
-              className="mt-5 w-full bg-gradient-to-r from-amber-500 to-yellow-500 text-amber-950 font-bold py-3 rounded-xl premium-glow"
+              className="non-game-primary-button mt-5 w-full"
             >
               Entrer dans le jeu
             </button>
@@ -1235,118 +1314,108 @@ const MenuScreenContent: React.FC<{
         </div>
       )}
 
-      <div className="mx-auto w-full max-w-md flex flex-col min-h-[calc(100dvh-3rem)]">
-        <div className="premium-panel rounded-2xl px-3 py-2 mb-5 flex items-center justify-between">
+      <div className="flex flex-col min-h-[calc(100dvh-1rem)]">
+        <div className="home-profile-bar">
           <div className="flex items-center gap-2 min-w-0">
-            <div className="w-9 h-9 rounded-full premium-chip flex items-center justify-center text-base shrink-0">
-              👤
+            <div className="home-avatar">
+              <UiIcon name="profile" size={25} />
             </div>
             <div className="min-w-0">
-              <p className="text-[11px] text-green-300/80 leading-none mb-1">Joueur</p>
-              <p className="text-sm font-semibold text-green-100 truncate">Invité</p>
+              <p className="home-profile-label">Profil joueur</p>
+              <p className="home-profile-name">Invité</p>
             </div>
           </div>
           <div className="flex items-center gap-2 shrink-0">
-            <div className="premium-chip rounded-xl px-2.5 py-1.5 flex items-center gap-1.5 min-w-[70px] justify-center">
-              <span className="text-amber-300 text-sm leading-none">🎟</span>
-              <span className="text-sm font-bold text-amber-200 leading-none">{availableMatches}</span>
+            <div className="home-ticket-badge" aria-label={`${availableMatches} parties disponibles`}>
+              <UiIcon name="ticket" size={19} />
+              <strong>{availableMatches}</strong>
             </div>
             <button
               onClick={onAddMatchEntry}
-              className="premium-chip w-8 h-8 rounded-lg flex items-center justify-center text-sm font-black text-amber-200 hover:text-white hover:bg-amber-500/20 transition-colors"
+              className="home-header-button home-header-button--add"
               aria-label="Gagner une partie"
-              title="Regarder une video pour gagner une partie"
+              title="Regarder une vidéo pour gagner une partie"
               disabled={rewardedAdOpen}
             >
-              +
+              <UiIcon name="plus" size={19} />
             </button>
             <button
               onClick={() => setMenuScreen('settings')}
-              className="premium-chip w-9 h-9 rounded-xl flex items-center justify-center text-base hover:text-amber-200 transition-colors"
-              aria-label="Parametres"
+              className="home-header-button"
+              aria-label="Paramètres"
             >
-              ⚙
+              <UiIcon name="settings" size={20} />
             </button>
           </div>
         </div>
 
         {matchEntryError && (
-          <div className="mb-4 bg-red-900/40 border border-red-500/30 rounded-xl p-3 text-red-300 text-xs text-center">
-            ⚠️ {matchEntryError}
+          <div className="non-game-alert non-game-alert--error mb-4">
+            <span aria-hidden="true">!</span> {matchEntryError}
           </div>
         )}
 
-        <div className="text-left mb-7">
-          <div>
-            <div className="text-2xl mb-1 tracking-wide">♠ ♥ ♦ ♣</div>
-            <h1 className="premium-title text-5xl font-black bg-gradient-to-r from-amber-300 via-yellow-400 to-amber-500 bg-clip-text text-transparent leading-none">
-              CHKOBA
-            </h1>
-            <p className="text-green-300 mt-2 text-sm">Le jeu de cartes tunisien</p>
+        <section className="home-brand-stage">
+          <div className="home-brand-suits" aria-hidden="true"><span>♠</span><b>♥</b><b>♦</b><span>♣</span></div>
+          <p className="non-game-kicker">Le jeu de cartes tunisien</p>
+          <h1 className="home-brand-title">CHKOBA</h1>
+          <p className="home-brand-arabic" lang="ar">شكبة</p>
+          <div className="home-card-fan" aria-label="Cartes de Chkoba">
+            {SAMPLE_CARDS.slice(0, 3).map((card) => (
+              <CardComponent key={card.id} card={card} small />
+            ))}
           </div>
-        </div>
+        </section>
 
-        <div className="mb-7 flex justify-center gap-2 opacity-90">
-          {SAMPLE_CARDS.slice(0, 3).map((card) => (
-            <CardComponent key={card.id} card={card} small />
-          ))}
-        </div>
-
-        <div className="space-y-4">
-          <BannerAd />
-
-          <button
+        <div className="home-action-stack">
+          <MenuActionCard
             onClick={openOnlineMenu}
-            className={cn(
-              "w-full rounded-2xl p-5 text-left transition-all duration-200",
-              "bg-gradient-to-r from-emerald-500/90 to-teal-600/90 hover:from-emerald-400 hover:to-teal-500",
-              "border border-emerald-200/20 shadow-[0_16px_30px_rgba(0,0,0,0.28)] hover:scale-[1.01] active:scale-[0.99]"
-            )}
-          >
-            <div className="text-2xl font-black text-white mb-1">Jouer en ligne</div>
-            <div className="text-emerald-100/90 text-sm">1v1 et 2v2 a distance</div>
-          </button>
+            title="Jouer en ligne"
+            subtitle="1v1 et 2v2 à distance"
+            icon={<UiIcon name="online" size={27} />}
+            tone="online"
+          />
 
-          <button
+          <MenuActionCard
             onClick={() => setMenuScreen('classic')}
-            className={cn(
-              "w-full rounded-2xl p-5 text-left transition-all duration-200",
-              "bg-gradient-to-r from-amber-500/90 to-yellow-600/90 hover:from-amber-400 hover:to-yellow-500",
-              "border border-amber-200/20 shadow-[0_16px_30px_rgba(0,0,0,0.28)] hover:scale-[1.01] active:scale-[0.99]"
-            )}
-          >
-            <div className="text-2xl font-black text-amber-950 mb-1">Jouer classique</div>
-            <div className="text-amber-900/85 text-sm">Solo ou a deux sur le meme appareil</div>
-          </button>
+            title="Jouer classique"
+            subtitle="Solo ou à deux sur le même appareil"
+            icon={<UiIcon name="cards" size={27} />}
+            tone="classic"
+          />
         </div>
 
-        <div className="mt-6 flex gap-3">
+        <div className="home-secondary-nav">
           <button
             onClick={() => setMenuScreen('themes')}
-            className="premium-chip flex-1 rounded-xl py-2.5 text-sm font-semibold text-green-100 hover:text-white transition-colors"
+            className="non-game-secondary-button"
           >
-            Themes
+            <UiIcon name="theme" size={18} /> Thèmes
           </button>
           <button
             onClick={() => setMenuScreen('rules')}
-            className="premium-chip flex-1 rounded-xl py-2.5 text-sm font-semibold text-green-100 hover:text-white transition-colors"
+            className="non-game-secondary-button"
           >
-            Regles
+            <UiIcon name="rules" size={18} /> Règles
           </button>
         </div>
 
-        <div className="mt-auto pt-6">
-          <div className="text-center text-xs text-green-300/70">Version premium mobile</div>
+        <div className="home-signature mt-auto">
+          <span aria-hidden="true" />
+          <p>Conçu en Tunisie</p>
+          <span aria-hidden="true" />
         </div>
 
+        <BannerAd />
+
         {matchEntryToast && (
-          <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[95] premium-panel rounded-full px-4 py-2 text-emerald-200 text-sm font-bold">
+          <div className="non-game-toast">
             {matchEntryToast}
           </div>
         )}
       </div>
 
-    </div>
+    </NonGameScreen>
   );
 };
 
@@ -1356,21 +1425,11 @@ const MenuSubScreenShell: React.FC<{ title: string; subtitle: string; onBack: ()
   onBack,
   children,
 }) => (
-  <div className="premium-screen premium-scroll safe-area min-h-screen text-white px-5 py-6">
-    <div className="mx-auto max-w-md w-full">
-      <button
-        onClick={onBack}
-        className="mb-5 premium-chip rounded-xl px-3 py-2 text-sm text-green-100 hover:text-white transition-colors"
-      >
-        ← Retour
-      </button>
-      <h1 className="premium-title text-4xl font-black bg-gradient-to-r from-amber-300 via-yellow-400 to-amber-500 bg-clip-text text-transparent mb-1">
-        {title}
-      </h1>
-      <p className="text-green-300 mb-6">{subtitle}</p>
+  <NonGameScreen className="menu-selection-screen" contentClassName="non-game-page-pad">
+      <BackButton onClick={onBack} />
+      <NonGameHero title={title} subtitle={subtitle} eyebrow="Chkoba" compact />
       {children}
-    </div>
-  </div>
+  </NonGameScreen>
 );
 
 const ThemesScreen: React.FC<{
@@ -1379,23 +1438,24 @@ const ThemesScreen: React.FC<{
   onBack: () => void;
 }> = ({ visualTheme, onSetTheme, onBack }) => (
   <MenuSubScreenShell
-    title="Themes"
+    title="Thèmes"
     subtitle="Personnalisez l'apparence du jeu"
     onBack={onBack}
   >
-    <div className="premium-panel rounded-2xl p-4 space-y-3">
+    <div className="non-game-settings-panel">
       {(['classic', 'gold', 'royal'] as VisualTheme[]).map((t) => (
         <button
           key={t}
           onClick={() => onSetTheme(t)}
           className={cn(
-            "w-full rounded-xl px-4 py-3 text-left border transition-colors",
-            visualTheme === t
-              ? "bg-amber-400/20 border-amber-300 text-amber-200"
-              : "premium-chip border-green-200/20 text-green-100 hover:bg-black/35"
+            "theme-choice",
+            `theme-choice--${t}`,
+            visualTheme === t && "theme-choice--active"
           )}
         >
-          Theme {t}
+          <span className="theme-choice__swatch" aria-hidden="true" />
+          <span><strong>{t === 'classic' ? 'Classique' : t === 'gold' ? 'Or' : 'Royal'}</strong><small>{t === 'classic' ? 'Vert profond et laiton' : t === 'gold' ? 'Bois chaud et lumière dorée' : 'Bleu nuit méditerranéen'}</small></span>
+          {visualTheme === t && <b>Actif</b>}
         </button>
       ))}
     </div>
@@ -1404,27 +1464,27 @@ const ThemesScreen: React.FC<{
 
 const RulesScreen: React.FC<{ onBack: () => void }> = ({ onBack }) => (
   <MenuSubScreenShell
-    title="Regles"
+    title="Règles"
     subtitle="Principes de base de la Chkoba tunisienne"
     onBack={onBack}
   >
-    <div className="premium-panel rounded-2xl p-5">
-      <ul className="text-sm text-green-200 space-y-2">
-        <li className="flex items-start gap-2">
-          <span className="text-amber-400">•</span>
-          <span>40 cartes: ♠ Pique, ♥ Coeur, ♦ Carreau, ♣ Trefle</span>
+    <div className="non-game-settings-panel rules-panel">
+      <ul>
+        <li>
+          <span>01</span>
+          <span>40 cartes : ♠ Pique, ♥ Cœur, ♦ Carreau, ♣ Trèfle</span>
         </li>
-        <li className="flex items-start gap-2">
-          <span className="text-amber-400">•</span>
-          <span>Valeurs: As(1), 2-7, Dame(8), Valet(9), Roi(10)</span>
+        <li>
+          <span>02</span>
+          <span>Valeurs : As (1), 2 à 7, Dame (8), Valet (9), Roi (10)</span>
         </li>
-        <li className="flex items-start gap-2">
-          <span className="text-amber-400">•</span>
-          <span>Capture = somme egale a la carte jouee</span>
+        <li>
+          <span>03</span>
+          <span>Capture : somme égale à la carte jouée</span>
         </li>
-        <li className="flex items-start gap-2">
-          <span className="text-amber-400">•</span>
-          <span>Chkoba: table videe = +1 point</span>
+        <li>
+          <span>04</span>
+          <span>Chkoba : table vidée = +1 point</span>
         </li>
       </ul>
     </div>
@@ -1433,20 +1493,19 @@ const RulesScreen: React.FC<{ onBack: () => void }> = ({ onBack }) => (
 
 const SettingsScreen: React.FC<{ unlocked: AchievementId[]; onBack: () => void }> = ({ unlocked, onBack }) => (
   <MenuSubScreenShell
-    title="Parametres"
+    title="Paramètres"
     subtitle="Progression et personnalisation"
     onBack={onBack}
   >
-    <div className="premium-panel rounded-2xl p-5">
-      <h4 className="text-amber-300 font-bold mb-3">Achievements</h4>
-      <div className="grid grid-cols-1 gap-2">
+    <div className="non-game-settings-panel achievements-panel">
+      <h4>Progression</h4>
+      <div className="achievement-list">
         {ACHIEVEMENTS.map((a) => {
           const done = unlocked.includes(a.id);
           return (
-            <div key={a.id} className={cn("rounded-lg px-3 py-2 text-sm", done ? "text-amber-200 bg-amber-500/10" : "text-green-200/60 bg-black/20")}>
-              <span className="mr-2">{done ? "✅" : "⬜"}</span>
-              <span className="font-semibold">{a.title}</span>
-              <span className="ml-2 text-xs opacity-80">{a.description}</span>
+            <div key={a.id} className={cn("achievement-item", done && "achievement-item--done")}>
+              <span>{done ? "✓" : "·"}</span>
+              <div><strong>{a.title}</strong><small>{a.description}</small></div>
             </div>
           );
         })}
@@ -1492,91 +1551,88 @@ const OnlineLobbyScreen: React.FC<{
   };
 
   return (
-  <div className="premium-screen premium-scroll safe-area min-h-screen flex flex-col items-center justify-center text-white p-6">
-    <div className="text-center mb-6">
-      <div className="text-3xl mb-2">🌐</div>
-      <h1 className="text-4xl font-black bg-gradient-to-r from-emerald-300 to-teal-400 bg-clip-text text-transparent mb-1">
-        1v1 en ligne
-      </h1>
-      <p className="text-green-300">Jouez avec un ami à distance</p>
-    </div>
+  <NonGameScreen className="online-lobby-screen" contentClassName="online-lobby-content non-game-page-pad">
+    <NonGameHero
+      icon={<span className="mode-mark">1×1</span>}
+      eyebrow="Salon privé"
+      title="1v1 en ligne"
+      subtitle="Invitez un ami et disputez un duel à distance."
+      compact
+    />
 
     {(onlinePhase === 'idle' || onlinePhase === 'error') && (
-      <div className="w-full max-w-sm mb-4">
-        <div className="bg-cyan-400/90 text-cyan-950 rounded-2xl px-4 py-3 flex items-center justify-between shadow-[0_14px_30px_rgba(0,0,0,0.24)] border border-cyan-100/40">
+      <div className="lobby-balance-wrap">
+        <div className="lobby-balance">
           <div className="flex items-center gap-2 min-w-0">
-            <span className="text-lg">🎬</span>
-            <span className="font-bold text-sm truncate">Parties disponibles : {availableMatches}</span>
+            <span className="lobby-balance__icon" aria-hidden="true"><UiIcon name="ticket" size={20} /></span>
+            <span className="lobby-balance__copy"><small>Votre solde</small><strong>{availableMatches} partie{availableMatches > 1 ? 's' : ''}</strong></span>
           </div>
           <button
             onClick={onAddMatchEntry}
-            className="rounded-full border border-cyan-200/70 bg-white/40 hover:bg-white/55 transition-colors px-3 py-1 text-sm font-semibold"
+            className="lobby-add-button"
             title="Regarder une vidéo pour gagner une partie"
             aria-label="Ajouter une partie via vidéo"
             disabled={rewardedAdOpen}
           >
-            + Ajouter
+            <UiIcon name="plus" size={16} /> Ajouter
           </button>
         </div>
         {matchEntryError && (
-          <div className="mt-2 bg-red-900/40 border border-red-500/30 rounded-xl p-3 text-red-300 text-xs text-center">
-            ⚠️ {matchEntryError}
+          <div className="non-game-alert non-game-alert--error mt-2">
+            <span aria-hidden="true">!</span> {matchEntryError}
           </div>
         )}
       </div>
     )}
 
-    {/* Player name input */}
-    <div className="w-full max-w-sm mb-6">
-      <label className="text-sm text-green-300 mb-1 block">Votre pseudo :</label>
+    <div className="lobby-field-group">
+      <label className="lobby-label" htmlFor="online-player-name"><span>01</span> Votre pseudo</label>
       <input
+        id="online-player-name"
         type="text"
         value={playerName}
         onChange={(e) => onSetPlayerName(e.target.value)}
         placeholder="Entrez votre pseudo..."
         maxLength={20}
-        className="w-full bg-green-800/50 border border-green-600/30 rounded-xl px-4 py-3 text-white placeholder-green-500 focus:outline-none focus:border-emerald-400 focus:ring-1 focus:ring-emerald-400 transition-colors"
+        className="lobby-input"
       />
     </div>
 
     {onlinePhase === 'idle' || onlinePhase === 'error' ? (
-      <div className="w-full max-w-sm space-y-4">
-        {/* Create room */}
+      <div className="lobby-actions">
         <button
           onClick={handleCreateClick}
-          className="w-full bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-white font-bold text-lg px-6 py-4 rounded-xl shadow-lg hover:scale-105 transition-all flex items-center justify-center gap-3"
+          className="lobby-create-card"
         >
-          <span className="text-2xl">🏠</span>
-          <div className="text-left">
-            <div>Créer une Partie</div>
-            <div className="text-sm font-normal text-emerald-200">Invitez un ami avec un code</div>
-          </div>
+          <span className="lobby-create-card__icon" aria-hidden="true"><UiIcon name="plus" size={25} /></span>
+          <span className="lobby-create-card__copy"><strong>Créer une partie</strong><small>Recevez un code à partager</small></span>
+          <span className="lobby-create-card__arrow" aria-hidden="true">›</span>
         </button>
 
-        {/* Divider */}
-        <div className="flex items-center gap-3">
-          <div className="flex-1 border-t border-green-600/30"></div>
-          <span className="text-green-500 text-sm">ou</span>
-          <div className="flex-1 border-t border-green-600/30"></div>
+        <div className="lobby-divider">
+          <span />
+          <b>ou</b>
+          <span />
         </div>
 
-        {/* Join room */}
-        <div className="bg-green-800/40 rounded-xl p-4 border border-green-600/30">
-          <h3 className="text-emerald-300 font-bold mb-3 flex items-center gap-2">
-            <span>🔗</span> Rejoindre une Partie
-          </h3>
-          <div className="flex flex-col gap-2">
+        <div className="lobby-join-card">
+          <div className="lobby-join-card__heading">
+            <span aria-hidden="true"><UiIcon name="link" size={19} /></span>
+            <div><strong>Rejoindre une partie</strong><small>Saisissez le code reçu</small></div>
+          </div>
+          <div className="lobby-join-form">
             <input
               type="text"
               value={joinCode}
               onChange={(e) => onSetJoinCode(onlineManager.normalizeRoomCode(e.target.value))}
-              placeholder="Code de la room..."
+              placeholder="CODE SALON"
               maxLength={ROOM_CODE_LENGTH}
-              className="w-full bg-green-900/50 border border-green-600/30 rounded-lg px-4 py-3 text-white text-center text-lg font-mono tracking-widest placeholder-green-600 focus:outline-none focus:border-emerald-400 uppercase"
+              className="lobby-input lobby-code-input"
+              aria-label="Code du salon"
             />
             <button
               onClick={onJoinRoom}
-              className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-6 py-3 rounded-lg transition-colors"
+              className="lobby-join-button"
             >
               Rejoindre
             </button>
@@ -1584,102 +1640,70 @@ const OnlineLobbyScreen: React.FC<{
         </div>
 
         {onlineError && (
-          <div className="bg-red-900/40 border border-red-500/30 rounded-xl p-3 text-red-300 text-sm text-center">
-            ⚠️ {onlineError}
+          <div className="non-game-alert non-game-alert--error">
+            <span aria-hidden="true">!</span> {onlineError}
           </div>
         )}
       </div>
     ) : onlinePhase === 'creating' || onlinePhase === 'joining' ? (
-      <div className="text-center">
-        <div className="animate-spin text-4xl mb-4">⏳</div>
-        <p className="text-green-300 text-lg">
-          {onlinePhase === 'creating' ? 'Création de la room...' : 'Connexion en cours...'}
+      <div className="lobby-state-card">
+        <div className="lobby-loader" aria-hidden="true" />
+        <p>
+          {onlinePhase === 'creating' ? 'Création du salon...' : 'Connexion en cours...'}
         </p>
       </div>
     ) : onlinePhase === 'waiting' ? (
-      <div className="w-full max-w-sm space-y-4">
-        <div className="bg-green-800/60 backdrop-blur rounded-2xl p-6 border border-emerald-500/30 text-center">
-          <div className="text-2xl mb-3">⏳</div>
-          <p className="text-green-300 mb-4">En attente d'un adversaire...</p>
+      <div className="lobby-state-card lobby-waiting-card">
+          <div className="lobby-waiting-mark" aria-hidden="true"><span /></div>
+          <h2>En attente d'un adversaire</h2>
+          <p>Partagez ce code avec votre ami</p>
           
-          <div className="mb-4">
-            <p className="text-xs text-green-500 mb-2">Partagez ce code avec votre ami :</p>
-            <div className="flex items-center justify-center gap-2">
-              <div className="bg-green-900/80 border-2 border-emerald-400 rounded-xl px-6 py-4 text-3xl font-mono font-black tracking-[0.3em] text-emerald-300 select-all">
+          <div className="lobby-room-row">
+              <div className="lobby-room-code">
                 {roomCode}
               </div>
               <button
                 onClick={onCopyCode}
-                className={cn(
-                  "p-3 rounded-lg transition-all text-lg",
-                  copied
-                    ? "bg-emerald-600 text-white"
-                    : "bg-green-700/50 hover:bg-green-600/50 text-green-300"
-                )}
+                className={cn("lobby-copy-button", copied && "lobby-copy-button--copied")}
                 title="Copier le code"
               >
-                {copied ? '✅' : '📋'}
+                <UiIcon name={copied ? 'check' : 'copy'} size={20} />
               </button>
-            </div>
-            {copied && (
-              <p className="text-emerald-400 text-xs mt-2 animate-bounce-in">Code copié !</p>
-            )}
           </div>
+            {copied && (
+              <p className="lobby-copied animate-bounce-in">Code copié !</p>
+            )}
 
-          <div className="flex items-center justify-center gap-2 text-green-500 text-sm">
-            <div className="animate-pulse w-2 h-2 bg-emerald-400 rounded-full"></div>
+          <div className="lobby-live-status">
+            <i />
             <span>En attente de connexion...</span>
           </div>
-        </div>
       </div>
     ) : onlinePhase === 'disconnected' ? (
-      <div className="text-center">
-        <div className="text-4xl mb-4">😔</div>
-        <p className="text-red-300 text-lg mb-4">L'adversaire s'est déconnecté</p>
+      <div className="lobby-state-card lobby-state-card--error">
+        <UiIcon name="link" size={34} className="mb-3" />
+        <p>L'adversaire s'est déconnecté</p>
       </div>
     ) : onlinePhase === 'connected' ? (
-      <div className="text-center">
-        <div className="animate-spin text-4xl mb-4">🔄</div>
-        <p className="text-green-300 text-lg">Synchronisation de la partie...</p>
+      <div className="lobby-state-card">
+        <div className="lobby-loader" aria-hidden="true" />
+        <p>Synchronisation de la partie...</p>
       </div>
     ) : null}
 
     <button
       onClick={onBack}
-      className="mt-6 text-green-400 hover:text-white text-sm hover:bg-green-700/50 rounded-lg px-4 py-2 transition-colors"
+      className="lobby-exit-button"
     >
-      ← Quitter
+      <UiIcon name="back" size={17} /> Quitter
     </button>
 
-    {showCreateScorePicker && (
-      <div className="fixed inset-0 z-[70] bg-black/60 backdrop-blur-sm flex items-center justify-center p-6">
-        <div className="premium-panel rounded-2xl max-w-sm w-full p-5 relative">
-          <button
-            onClick={() => setShowCreateScorePicker(false)}
-            className="absolute top-3 right-3 w-8 h-8 rounded-full premium-chip text-green-200 hover:text-white"
-            aria-label="Fermer"
-          >
-            ✕
-          </button>
-          <h3 className="premium-title text-2xl font-black text-amber-200 mb-2">Choisir Le Score</h3>
-          <p className="text-green-200/90 text-sm mb-4">Créer la partie en ligne jusqu a:</p>
-          <div className="grid grid-cols-2 gap-3">
-            <button
-              onClick={() => chooseCreateScore(11)}
-              className="bg-gradient-to-r from-emerald-500 to-teal-600 text-white font-bold py-3 rounded-xl premium-glow"
-            >
-              11 points
-            </button>
-            <button
-              onClick={() => chooseCreateScore(21)}
-              className="bg-gradient-to-r from-amber-500 to-yellow-500 text-amber-950 font-bold py-3 rounded-xl premium-glow"
-            >
-              21 points
-            </button>
-          </div>
-        </div>
-      </div>
-    )}
+    <ScoreChoiceModal
+      open={showCreateScorePicker}
+      description="Choisissez la durée de votre duel en ligne."
+      onClose={() => setShowCreateScorePicker(false)}
+      onSelect={chooseCreateScore}
+    />
 
     <NotEnoughCoinsModal
       open={showNotEnoughMatchEntries}
@@ -1695,11 +1719,11 @@ const OnlineLobbyScreen: React.FC<{
     />
 
     {matchEntryToast && (
-      <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[95] premium-panel rounded-full px-4 py-2 text-emerald-200 text-sm font-bold">
+      <div className="non-game-toast">
         {matchEntryToast}
       </div>
     )}
-  </div>
+  </NonGameScreen>
   );
 };
 

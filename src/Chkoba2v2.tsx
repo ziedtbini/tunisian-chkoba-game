@@ -1,14 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { App as CapacitorApp } from "@capacitor/app";
 import { CardComponent, CardBack } from "./CardComponent";
-import { cardName, createDeck, dealCards, findCaptures } from "./gameLogic";
+import { cardName, computerPlay, createDeck, dealCards, findCaptures } from "./gameLogic";
 import { Card } from "./types";
 import { onlineManager, ROOM_CODE_LENGTH } from "./onlineManager";
 import { feedback, setupAudioUnlock } from "./utils/premiumFx";
 import QuitConfirmModal from "./components/QuitConfirmModal";
+import TurnTimer from "./components/TurnTimer";
 import NotEnoughCoinsModal from "./components/NotEnoughCoinsModal";
 import { sameIdSet } from "./online/validation";
 import { twoVTwoSession, type Online2v2State } from "./online/twoVTwoSession";
 import type { Online2v2View } from "./online/protocol";
+import { NonGameHero, NonGameScreen, ScoreChoiceModal } from "./components/NonGameUI";
+import UiIcon from "./components/UiIcon";
+import BannerAd, { hideBannerAd } from "./components/BannerAd";
 
 type Team = "A" | "B";
 type Seat = "p1" | "p2" | "p3" | "p4";
@@ -230,6 +235,7 @@ export default function Chkoba2v2({
   const [onlineError, setOnlineError] = useState("");
   const prevMsgRef = useRef("");
   const gameRef = useRef<Game2v2>(game);
+  const onlineResumeTimerRef = useRef<number | null>(null);
   const [showQuitConfirm, setShowQuitConfirm] = useState(false);
   const [targetScore, setTargetScore] = useState<ScoreTarget>(initialTargetScore);
   const [showCreateScorePicker, setShowCreateScorePicker] = useState(false);
@@ -245,6 +251,12 @@ export default function Chkoba2v2({
   useEffect(() => {
     setupAudioUnlock();
   }, []);
+
+  useEffect(() => {
+    // Native banners are overlays: remove them for every in-match screen so
+    // they can never cover the local player's cards.
+    if (game) void hideBannerAd();
+  }, [game]);
 
   useEffect(() => {
     if (game.phase === "gameOver") {
@@ -332,15 +344,37 @@ export default function Chkoba2v2({
 
   useEffect(() => {
     if (mode !== "online") return;
-    const resume = () => {
-      onlineManager.reconnectSignalling();
-      if (onlineManager.isConnected() && !onlineManager.isHost) twoVTwoSession.requestSync();
+    const cancelResume = () => {
+      if (onlineResumeTimerRef.current !== null) {
+        window.clearTimeout(onlineResumeTimerRef.current);
+        onlineResumeTimerRef.current = null;
+      }
     };
-    window.addEventListener("online", resume);
-    document.addEventListener("visibilitychange", resume);
+    const scheduleResume = () => {
+      if (document.visibilityState === "hidden" || onlineResumeTimerRef.current !== null) return;
+      onlineResumeTimerRef.current = window.setTimeout(() => {
+        onlineResumeTimerRef.current = null;
+        onlineManager.resumeConnection();
+        if (onlineManager.isConnected() && !onlineManager.isHost) twoVTwoSession.requestSync();
+      }, 150);
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") scheduleResume();
+      else cancelResume();
+    };
+    window.addEventListener("online", scheduleResume);
+    window.addEventListener("offline", cancelResume);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    const appStateListener = CapacitorApp.addListener("appStateChange", ({ isActive }) => {
+      if (isActive) scheduleResume();
+      else cancelResume();
+    });
     return () => {
-      window.removeEventListener("online", resume);
-      document.removeEventListener("visibilitychange", resume);
+      cancelResume();
+      window.removeEventListener("online", scheduleResume);
+      window.removeEventListener("offline", cancelResume);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      void appStateListener.then((listener) => listener.remove());
     };
   }, [mode]);
 
@@ -428,6 +462,25 @@ export default function Chkoba2v2({
     setPending(null);
   };
 
+  const handleTurnExpired = () => {
+    const current = gameRef.current;
+    if (current.phase !== "playing") return;
+    setPending(null);
+    if (mode === "online") {
+      if (onlineManager.isHost) twoVTwoSession.forceTimedTurn();
+      return;
+    }
+    updateAuthoritativeState((prev) => {
+      if (prev.phase !== "playing") return prev;
+      const seat = prev.currentTurn;
+      const hand = prev.hands[seat];
+      if (hand.length === 0) return prev;
+      const { card, capture } = computerPlay(hand, prev.table);
+      const next = applyPlay(prev, seat, card.id, capture?.map((item) => item.id));
+      return { ...next, message: `Temps écoulé. ${next.message}` };
+    });
+  };
+
   const startNextRound = () => {
     if (mode === "online" && !onlineManager.isHost) {
       twoVTwoSession.requestNextRound();
@@ -494,7 +547,7 @@ export default function Chkoba2v2({
     }
     const code = onlineManager.normalizeRoomCode(joinCode);
     if (code.length !== ROOM_CODE_LENGTH) {
-      setOnlineError(`Code room ${ROOM_CODE_LENGTH} caracteres`);
+      setOnlineError(`Le code du salon doit contenir ${ROOM_CODE_LENGTH} caractères.`);
       return;
     }
     setOnlineError("");
@@ -510,84 +563,86 @@ export default function Chkoba2v2({
 
   if (mode === "online" && onlinePhase !== "connected") {
     return (
-      <div className="premium-screen premium-scroll safe-area min-h-screen flex flex-col items-center justify-center text-white p-6">
-        <div className="text-center mb-6">
-          <div className="text-3xl mb-2">🌐</div>
-          <h1 className="text-4xl font-black bg-gradient-to-r from-emerald-300 to-teal-400 bg-clip-text text-transparent mb-1">
-            Jeu en Ligne 2v2
-          </h1>
-          <p className="text-green-300">Jouez en equipe avec un ami a distance</p>
-        </div>
+      <>
+      <NonGameScreen className="online-lobby-screen" contentClassName="online-lobby-content non-game-page-pad">
+        <NonGameHero
+          icon={<span className="mode-mark">2×2</span>}
+          eyebrow="Salon en équipe"
+          title="2v2 en ligne"
+          subtitle="Invitez vos amis et formez deux équipes à distance."
+          compact
+        />
 
         {(onlinePhase === "idle" || onlinePhase === "error") && (
-          <div className="w-full max-w-sm mb-4">
-            <div className="bg-cyan-400/90 text-cyan-950 rounded-2xl px-4 py-3 flex items-center justify-between shadow-[0_14px_30px_rgba(0,0,0,0.24)] border border-cyan-100/40">
+          <div className="lobby-balance-wrap">
+            <div className="lobby-balance">
               <div className="flex items-center gap-2 min-w-0">
-                <span className="text-lg">🎬</span>
-                <span className="font-bold text-sm truncate">Parties disponibles : {availableMatches}</span>
+                <span className="lobby-balance__icon" aria-hidden="true"><UiIcon name="ticket" size={20} /></span>
+                <span className="lobby-balance__copy"><small>Votre solde</small><strong>{availableMatches} partie{availableMatches > 1 ? "s" : ""}</strong></span>
               </div>
               <button
                 onClick={onAddMatchEntry}
-                className="rounded-full border border-cyan-200/70 bg-white/40 hover:bg-white/55 transition-colors px-3 py-1 text-sm font-semibold"
+                className="lobby-add-button"
                 title="Regarder une vidéo pour gagner une partie"
                 aria-label="Ajouter une partie via vidéo"
                 disabled={rewardedAdOpen}
               >
-                + Ajouter
+                <UiIcon name="plus" size={16} /> Ajouter
               </button>
             </div>
             {matchEntryError && (
-              <div className="mt-2 bg-red-900/40 border border-red-500/30 rounded-xl p-3 text-red-300 text-xs text-center">
-                ⚠️ {matchEntryError}
+              <div className="non-game-alert non-game-alert--error mt-2">
+                <span aria-hidden="true">!</span> {matchEntryError}
               </div>
             )}
           </div>
         )}
 
         {(onlinePhase === "idle" || onlinePhase === "error") && (
-          <div className="w-full max-w-sm space-y-4">
-            <div className="w-full">
-              <label className="text-sm text-green-300 mb-1 block">Votre pseudo :</label>
+          <div className="lobby-actions">
+            <div className="lobby-field-group">
+              <label className="lobby-label" htmlFor="online-2v2-player-name"><span>01</span> Votre pseudo</label>
               <input
+                id="online-2v2-player-name"
                 type="text"
                 value={playerName}
                 onChange={(e) => setPlayerName(e.target.value)}
                 placeholder="Entrez votre pseudo..."
                 maxLength={20}
-                className="w-full bg-green-800/50 border border-green-600/30 rounded-xl px-4 py-3 text-white placeholder-green-500 focus:outline-none focus:border-emerald-400 focus:ring-1 focus:ring-emerald-400 transition-colors"
+                className="lobby-input"
               />
             </div>
             <button
-              className="w-full bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-white font-bold text-lg px-6 py-4 rounded-xl shadow-lg hover:scale-105 transition-all flex items-center justify-center gap-3"
+              className="lobby-create-card"
               onClick={() => setShowCreateScorePicker(true)}
             >
-              <span className="text-2xl">🏠</span>
-              <div className="text-left">
-                <div>Creer une Partie</div>
-                <div className="text-sm font-normal text-emerald-200">Room 2v2 avec code</div>
-              </div>
+              <span className="lobby-create-card__icon" aria-hidden="true"><UiIcon name="plus" size={25} /></span>
+              <span className="lobby-create-card__copy"><strong>Créer une partie</strong><small>Ouvrez un salon privé 2v2</small></span>
+              <span className="lobby-create-card__arrow" aria-hidden="true">›</span>
             </button>
 
-            <div className="flex items-center gap-3">
-              <div className="flex-1 border-t border-green-600/30"></div>
-              <span className="text-green-500 text-sm">ou</span>
-              <div className="flex-1 border-t border-green-600/30"></div>
+            <div className="lobby-divider">
+              <span />
+              <b>ou</b>
+              <span />
             </div>
 
-            <div className="bg-green-800/40 rounded-xl p-4 border border-green-600/30">
-              <h3 className="text-emerald-300 font-bold mb-3 flex items-center gap-2">
-                <span>🔗</span> Rejoindre une Partie
-              </h3>
-              <div className="flex flex-col gap-2">
+            <div className="lobby-join-card">
+              <div className="lobby-join-card__heading">
+                <span aria-hidden="true"><UiIcon name="link" size={19} /></span>
+                <div><strong>Rejoindre une partie</strong><small>Saisissez le code reçu</small></div>
+              </div>
+              <div className="lobby-join-form">
                 <input
-                  className="w-full bg-green-900/50 border border-green-600/30 rounded-lg px-4 py-3 text-white text-center text-lg font-mono tracking-widest placeholder-green-600 focus:outline-none focus:border-emerald-400 uppercase"
+                  className="lobby-input lobby-code-input"
                   value={joinCode}
                   onChange={(e) => setJoinCode(onlineManager.normalizeRoomCode(e.target.value))}
                   maxLength={ROOM_CODE_LENGTH}
-                  placeholder="Code de la room..."
+                  placeholder="CODE SALON"
+                  aria-label="Code du salon"
                 />
                 <button
-                  className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold px-6 py-3 rounded-lg transition-colors"
+                  className="lobby-join-button"
                   onClick={joinRoom}
                 >
                   Rejoindre
@@ -596,80 +651,53 @@ export default function Chkoba2v2({
             </div>
 
             {onlineError && (
-              <div className="bg-red-900/40 border border-red-500/30 rounded-xl p-3 text-red-300 text-sm text-center">
-                ⚠️ {onlineError}
+              <div className="non-game-alert non-game-alert--error">
+                <span aria-hidden="true">!</span> {onlineError}
               </div>
             )}
           </div>
         )}
 
-        {showCreateScorePicker && (onlinePhase === "idle" || onlinePhase === "error") && (
-          <div className="fixed inset-0 z-[70] bg-black/60 backdrop-blur-sm flex items-center justify-center p-6">
-            <div className="premium-panel rounded-2xl max-w-sm w-full p-5 relative">
-              <button
-                onClick={() => setShowCreateScorePicker(false)}
-                className="absolute top-3 right-3 w-8 h-8 rounded-full premium-chip text-green-200 hover:text-white"
-                aria-label="Fermer"
-              >
-                ✕
-              </button>
-              <h3 className="premium-title text-2xl font-black text-amber-200 mb-2">Choisir Le Score</h3>
-              <p className="text-green-200/90 text-sm mb-4">Créer la partie 2v2 en ligne jusqu a:</p>
-              <div className="grid grid-cols-2 gap-3">
-                <button
-                  onClick={() => {
-                    setShowCreateScorePicker(false);
-                    createRoom(11);
-                  }}
-                  className="bg-gradient-to-r from-emerald-500 to-teal-600 text-white font-bold py-3 rounded-xl premium-glow"
-                >
-                  11 points
-                </button>
-                <button
-                  onClick={() => {
-                    setShowCreateScorePicker(false);
-                    createRoom(21);
-                  }}
-                  className="bg-gradient-to-r from-amber-500 to-yellow-500 text-amber-950 font-bold py-3 rounded-xl premium-glow"
-                >
-                  21 points
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
+        <ScoreChoiceModal
+          open={showCreateScorePicker && (onlinePhase === "idle" || onlinePhase === "error")}
+          description="Choisissez la durée de votre partie en équipe."
+          onClose={() => setShowCreateScorePicker(false)}
+          onSelect={(score) => {
+            setShowCreateScorePicker(false);
+            createRoom(score);
+          }}
+        />
 
         {(onlinePhase === "creating" || onlinePhase === "joining") && (
-          <div className="text-center">
-            <div className="animate-spin text-4xl mb-4">⏳</div>
-            <p className="text-green-300 text-lg">
-              {onlinePhase === "creating" ? "Creation de la room..." : "Connexion en cours..."}
+          <div className="lobby-state-card">
+            <div className="lobby-loader" aria-hidden="true" />
+            <p>
+              {onlinePhase === "creating" ? "Création du salon..." : "Connexion en cours..."}
             </p>
           </div>
         )}
 
         {onlinePhase === "waiting" && (
-          <div className="w-full max-w-sm space-y-4">
-            <div className="bg-green-800/60 backdrop-blur rounded-2xl p-6 border border-emerald-500/30 text-center">
-              <div className="text-2xl mb-3">⏳</div>
-              <p className="text-green-300 mb-4">En attente de l'equipe adverse...</p>
-              <p className="text-xs text-green-500 mb-2">Partagez ce code:</p>
-              <div className="bg-green-900/80 border-2 border-emerald-400 rounded-xl px-6 py-4 text-3xl font-mono font-black tracking-[0.3em] text-emerald-300 select-all">
+          <div className="lobby-state-card lobby-waiting-card">
+              <div className="lobby-waiting-mark" aria-hidden="true"><span /></div>
+              <h2>En attente de l'équipe adverse</h2>
+              <p>Partagez ce code avec vos amis</p>
+              <div className="lobby-room-code">
                 {roomCode}
               </div>
-            </div>
+              <div className="lobby-live-status"><i /><span>Salon ouvert</span></div>
           </div>
         )}
 
         {onlinePhase === "disconnected" && (
-          <div className="text-center">
-            <div className="text-4xl mb-4">😔</div>
-            <p className="text-red-300 text-lg mb-4">L'adversaire s'est deconnecte</p>
+          <div className="lobby-state-card lobby-state-card--error">
+            <UiIcon name="link" size={34} className="mb-3" />
+            <p>L'adversaire s'est déconnecté</p>
           </div>
         )}
 
         <button
-          className="mt-6 text-green-400 hover:text-white text-sm hover:bg-green-700/50 rounded-lg px-4 py-2 transition-colors"
+          className="lobby-exit-button"
           onClick={() => {
             feedback("button");
             if (mode === "online") twoVTwoSession.destroy();
@@ -677,7 +705,7 @@ export default function Chkoba2v2({
             onExit();
           }}
         >
-          ← Quitter
+          <UiIcon name="back" size={17} /> Quitter
         </button>
 
         <NotEnoughCoinsModal
@@ -694,11 +722,13 @@ export default function Chkoba2v2({
         />
 
         {matchEntryToast && (
-          <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[95] premium-panel rounded-full px-4 py-2 text-emerald-200 text-sm font-bold">
+          <div className="non-game-toast">
             {matchEntryToast}
           </div>
         )}
-      </div>
+      </NonGameScreen>
+      <BannerAd />
+      </>
     );
   }
 
@@ -714,12 +744,18 @@ export default function Chkoba2v2({
     game.phase === "playing" &&
     game.currentTurn === pending.seat &&
     controllableSeats.includes(pending.seat);
+  const turnTimerKey = `${game.currentTurn}:${TURN_ORDER.map((seat) => game.hands[seat].length).join(':')}:${game.teamA.captured.length}:${game.teamB.captured.length}:${game.table.map((card) => card.id).join(',')}`;
+  const timerActive = game.phase === "playing" && (mode !== "online" || onlinePhase === "connected");
+  const timerIsAuthoritative = mode !== "online" || onlineManager.isHost;
 
   return (
-    <div className="premium-screen safe-area min-h-screen text-white p-4">
-      <div className="premium-panel rounded-2xl flex items-center justify-between mb-3 p-3">
+    <div className="premium-screen safe-area min-h-screen text-white p-4 tunisian-gameplay gameplay-2v2-screen">
+      <div className="game-mosaic-rail game-mosaic-rail--left" aria-hidden="true" />
+      <div className="game-mosaic-rail game-mosaic-rail--right" aria-hidden="true" />
+      <div className="premium-panel tunisian-hud rounded-2xl flex items-center justify-between mb-3 p-3">
         <h1 className="premium-title text-xl font-bold">Chkoba 2v2 {isOnline ? "Online" : "Local"}</h1>
         <div className="premium-chip rounded-lg px-3 py-1 text-sm">A: {game.teamA.score} | B: {game.teamB.score}</div>
+        <TurnTimer compact turnKey={turnTimerKey} active={timerActive} onExpire={timerIsAuthoritative ? handleTurnExpired : undefined} />
         <button className="text-green-300 underline" onClick={requestQuit}>Quitter</button>
       </div>
       <QuitConfirmModal
@@ -743,7 +779,7 @@ export default function Chkoba2v2({
         ))}
       </div>
 
-      <div className="premium-panel rounded-xl p-3 mb-4">
+      <div className="premium-panel tunisian-2v2-table rounded-xl p-3 mb-4">
         <div className="text-xs mb-2">Table ({game.table.length})</div>
         <div className="stagger-row flex flex-wrap gap-2 justify-center">
           {game.table.map((c) => <CardComponent key={c.id} card={c} />)}

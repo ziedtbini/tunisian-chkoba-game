@@ -1,6 +1,7 @@
 import type { Card, GamePhase, PlayerSide, Score } from "../types";
 
 export const ONLINE_PROTOCOL_VERSION = 2 as const;
+export const RECONNECT_WINDOW_MS = 60_000;
 export const MAX_PLAYER_NAME_LENGTH = 20;
 export const MAX_CAPTURE_IDS = 12;
 

@@ -14,26 +14,27 @@ export default function QuitConfirmModal({
   if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-[90] bg-black/70 backdrop-blur-sm flex items-center justify-center p-6">
-      <div className="premium-panel rounded-2xl w-full max-w-md p-6">
-        <h3 className="premium-title text-2xl font-black text-amber-200 mb-2">Quitter La Partie ?</h3>
-        <p className="text-green-100/90 text-sm mb-4">Voulez-vous vraiment quitter la partie ?</p>
-        <p className="text-sm text-red-200 mb-5">Cette sortie comptera comme une défaite.</p>
-        <div className="grid grid-cols-2 gap-3">
+    <div className="non-game-modal-backdrop z-[90]">
+      <section className="non-game-modal w-full max-w-md" role="dialog" aria-modal="true" aria-labelledby="quit-modal-title">
+        <p className="non-game-kicker">Partie en cours</p>
+        <h3 id="quit-modal-title" className="non-game-modal__title">Quitter la partie ?</h3>
+        <p className="non-game-modal__message">Voulez-vous vraiment quitter la partie ?</p>
+        <p className="non-game-modal__warning">Cette sortie comptera comme une défaite.</p>
+        <div className="non-game-modal__actions">
           <button
             onClick={onCancel}
-            className="premium-chip rounded-xl py-3 text-green-200 font-semibold"
+            className="non-game-secondary-button"
           >
             Continuer
           </button>
           <button
             onClick={onConfirm}
-            className="bg-gradient-to-r from-red-500 to-rose-600 text-white rounded-xl py-3 font-bold premium-glow"
+            className="non-game-danger-button"
           >
             Quitter
           </button>
         </div>
-      </div>
+      </section>
     </div>
   );
 }

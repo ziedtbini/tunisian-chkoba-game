@@ -142,6 +142,15 @@ describe("1v1 v2 session over a simulated transport", () => {
     expect(guest.getStatus()).toBe("connected");
     expect(hostCharges).toBe(1);
     expect(guestCharges).toBe(1);
+
+    hostTransport.disconnect();
+    guestTransport.reconnect();
+
+    expect(hostTransport.sent.filter((message) => message.type === "REJOIN_ACCEPTED")).toHaveLength(2);
+    expect(host.getStatus()).toBe("connected");
+    expect(guest.getStatus()).toBe("connected");
+    expect(hostCharges).toBe(1);
+    expect(guestCharges).toBe(1);
   });
 
   test("rejects wrong versions, a second guest, invalid match ids, duplicate actions and invalid captures", async () => {
@@ -179,5 +188,22 @@ describe("1v1 v2 session over a simulated transport", () => {
     expect(parseOnlineMessage({ type: "game-state", payload: {} })).toBeNull();
     expect(parseOnlineMessage({ type: "play-card", payload: { cardId: "x" } })).toBeNull();
     expect(parseOnlineMessage({ type: "capture-choice", payload: { captureIds: [] } })).toBeNull();
+  });
+
+  test("host timeout plays one legal move and synchronizes it", async () => {
+    const { host, guest, hostTransport } = pair();
+    host.configure(callbacks());
+    guest.configure(callbacks());
+    await host.createRoom();
+    await guest.joinRoom("ABCDE", "Guest");
+
+    host.forceTimedTurn();
+
+    const next = host.getHostState();
+    expect(next?.currentTurn).toBe("player1");
+    expect(next?.player2.hand).toHaveLength(1);
+    expect(next?.player2.captured.length).toBeGreaterThan(0);
+    expect(next?.message).toContain("Temps écoulé");
+    expect(hostTransport.sent.at(-1)).toMatchObject({ type: "STATE_SNAPSHOT", stateVersion: 1 });
   });
 });
