@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react';
 import ChkobaGame from './ChkobaGame';
 import CardsDemo from './CardsDemo';
 import { checkForUpdate, openStore, UpdateDecision } from './updateGuard';
-import AdPrivacyButton from './components/AdPrivacyButton';
 
 function App() {
   const [showBootSplash, setShowBootSplash] = useState(true);
@@ -68,7 +67,6 @@ function App() {
   return (
     <>
       <ChkobaGame />
-      <AdPrivacyButton />
       {!checkingUpdate && updateDecision && !updateDecision.required && !dismissedOptionalUpdate && (
         <div
           className="fixed inset-0 z-[90] bg-black/45 backdrop-blur-sm flex items-center justify-center p-4"

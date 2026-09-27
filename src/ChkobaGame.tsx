@@ -21,7 +21,12 @@ import BannerAd, { hideBannerAd } from './components/BannerAd';
 import OnlineMenuScreen from './screens/OnlineMenuScreen';
 import ClassicMenuScreen from './screens/ClassicMenuScreen';
 import { DEFAULT_MATCH_ENTRIES, loadMatchEntries, saveMatchEntries } from './game/matchEntries';
-import { showRewardedMatchEntryAd } from './services/admobService';
+import {
+  isAdPrivacyOptionsRequired,
+  showAdPrivacyOptions,
+  showRewardedMatchEntryAd,
+  subscribeToAdPrivacyStatus,
+} from './services/admobService';
 import { oneVOneSession } from './online/oneVOneSession';
 import type { Online1v1View } from './online/protocol';
 import TurnTimer from './components/TurnTimer';
@@ -31,7 +36,10 @@ import UiIcon from './components/UiIcon';
 type VisualTheme = 'classic' | 'gold' | 'royal';
 type ScoreTarget = 11 | 21;
 type CaptureFx = { key: number; playedCard: Card; capturedCards: Card[] };
+type ChkobaOverlay = { key: number; fading: boolean };
 const ONLINE_MATCH_COST = 1;
+const CHKOBA_DISPLAY_MS = 2200;
+const CHKOBA_FADE_MS = 300;
 
 function gameStateFrom1v1View(view: Online1v1View): GameState {
   return {
@@ -86,6 +94,10 @@ export const ChkobaGame: React.FC = () => {
   const [achievementToast, setAchievementToast] = useState<string | null>(null);
   const [showQuitConfirm, setShowQuitConfirm] = useState(false);
   const [captureFx, setCaptureFx] = useState<CaptureFx | null>(null);
+  const [chkobaOverlay, setChkobaOverlay] = useState<ChkobaOverlay | null>(null);
+  const chkobaDisplayTimerRef = useRef<number | null>(null);
+  const chkobaFadeTimerRef = useRef<number | null>(null);
+  const chkobaOverlayKeyRef = useRef(0);
   const [availableMatches, setAvailableMatches] = useState(() => loadMatchEntries(DEFAULT_MATCH_ENTRIES));
   const [consumeMatchOnOnlineStart, setConsumeMatchOnOnlineStart] = useState(false);
   const [showNotEnoughMatchEntries, setShowNotEnoughMatchEntries] = useState(false);
@@ -247,6 +259,29 @@ export const ChkobaGame: React.FC = () => {
     const t = window.setTimeout(() => setCaptureFx(null), 1500);
     return () => window.clearTimeout(t);
   }, [captureFx]);
+
+  useEffect(() => {
+    if (!game?.showChkoba) return;
+
+    if (chkobaDisplayTimerRef.current !== null) window.clearTimeout(chkobaDisplayTimerRef.current);
+    if (chkobaFadeTimerRef.current !== null) window.clearTimeout(chkobaFadeTimerRef.current);
+
+    const key = ++chkobaOverlayKeyRef.current;
+    setChkobaOverlay({ key, fading: false });
+    chkobaDisplayTimerRef.current = window.setTimeout(() => {
+      setChkobaOverlay((current) => current?.key === key ? { ...current, fading: true } : current);
+      chkobaFadeTimerRef.current = window.setTimeout(() => {
+        setChkobaOverlay((current) => current?.key === key ? null : current);
+        chkobaFadeTimerRef.current = null;
+      }, CHKOBA_FADE_MS);
+      chkobaDisplayTimerRef.current = null;
+    }, CHKOBA_DISPLAY_MS);
+  }, [game?.showChkoba, game?.lastAction]);
+
+  useEffect(() => () => {
+    if (chkobaDisplayTimerRef.current !== null) window.clearTimeout(chkobaDisplayTimerRef.current);
+    if (chkobaFadeTimerRef.current !== null) window.clearTimeout(chkobaFadeTimerRef.current);
+  }, []);
 
   const clearTimer = () => {
     if (timerRef.current) {
@@ -938,8 +973,14 @@ export const ChkobaGame: React.FC = () => {
       <div className="game-cafe-cup" aria-hidden="true" />
       <div className="game-brass-charm" aria-hidden="true">◆</div>
       {/* Chkoba overlay */}
-      {game.showChkoba && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center pointer-events-none">
+      {chkobaOverlay && (
+        <div
+          key={chkobaOverlay.key}
+          className={cn(
+            "chkoba-overlay fixed inset-0 z-50 flex items-center justify-center pointer-events-none",
+            chkobaOverlay.fading && "chkoba-overlay--fading",
+          )}
+        >
           <div className="chkoba-celebration">
             <span>♠ ◆ ♥</span>
             <strong>CHKOBA</strong>
@@ -1491,28 +1532,48 @@ const RulesScreen: React.FC<{ onBack: () => void }> = ({ onBack }) => (
   </MenuSubScreenShell>
 );
 
-const SettingsScreen: React.FC<{ unlocked: AchievementId[]; onBack: () => void }> = ({ unlocked, onBack }) => (
-  <MenuSubScreenShell
-    title="Paramètres"
-    subtitle="Progression et personnalisation"
-    onBack={onBack}
-  >
-    <div className="non-game-settings-panel achievements-panel">
-      <h4>Progression</h4>
-      <div className="achievement-list">
-        {ACHIEVEMENTS.map((a) => {
-          const done = unlocked.includes(a.id);
-          return (
-            <div key={a.id} className={cn("achievement-item", done && "achievement-item--done")}>
-              <span>{done ? "✓" : "·"}</span>
-              <div><strong>{a.title}</strong><small>{a.description}</small></div>
-            </div>
-          );
-        })}
+const SettingsScreen: React.FC<{ unlocked: AchievementId[]; onBack: () => void }> = ({ unlocked, onBack }) => {
+  const [showPrivacy, setShowPrivacy] = useState(isAdPrivacyOptionsRequired);
+
+  useEffect(() => subscribeToAdPrivacyStatus(setShowPrivacy), []);
+
+  return (
+    <MenuSubScreenShell
+      title="Paramètres"
+      subtitle="Progression et personnalisation"
+      onBack={onBack}
+    >
+      {showPrivacy && (
+        <div className="non-game-settings-panel achievements-panel">
+          <h4>Préférences</h4>
+          <button
+            type="button"
+            className="achievement-item achievement-item--done w-full text-left"
+            onClick={() => void showAdPrivacyOptions()}
+          >
+            <span>i</span>
+            <div><strong>Confidentialité</strong><small>Gérer vos choix publicitaires</small></div>
+          </button>
+        </div>
+      )}
+
+      <div className="non-game-settings-panel achievements-panel">
+        <h4>Progression</h4>
+        <div className="achievement-list">
+          {ACHIEVEMENTS.map((a) => {
+            const done = unlocked.includes(a.id);
+            return (
+              <div key={a.id} className={cn("achievement-item", done && "achievement-item--done")}>
+                <span>{done ? "✓" : "·"}</span>
+                <div><strong>{a.title}</strong><small>{a.description}</small></div>
+              </div>
+            );
+          })}
+        </div>
       </div>
-    </div>
-  </MenuSubScreenShell>
-);
+    </MenuSubScreenShell>
+  );
+};
 
 // ---- Online Lobby Screen ----
 const OnlineLobbyScreen: React.FC<{

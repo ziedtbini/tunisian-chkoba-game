@@ -1,5 +1,10 @@
 import { Capacitor, type PluginListenerHandle } from "@capacitor/core";
-import { AdMob, AdmobConsentStatus, MaxAdContentRating, RewardAdPluginEvents } from "@capacitor-community/admob";
+import {
+  AdMob,
+  AdmobConsentStatus,
+  MaxAdContentRating,
+  RewardAdPluginEvents,
+} from "@capacitor-community/admob";
 import { admobConfig, getRewardedAdUnitId, isAdmobTestMode } from "../config/admobConfig";
 
 const PRIVACY_STATUS_EVENT = "chkoba:ad-privacy-status";
@@ -19,6 +24,12 @@ function isNativeMobilePlatform(): boolean {
 function publishPrivacyStatus(required: boolean): void {
   privacyOptionsRequired = required;
   window.dispatchEvent(new CustomEvent(PRIVACY_STATUS_EVENT, { detail: { required } }));
+}
+
+function publishPrivacyRequirementStatus(
+  status: Awaited<ReturnType<typeof AdMob.requestConsentInfo>>["privacyOptionsRequirementStatus"],
+): void {
+  publishPrivacyStatus(status === "REQUIRED");
 }
 
 async function requestIosTrackingAuthorization(): Promise<void> {
@@ -72,7 +83,7 @@ export function initializeAdMob(): Promise<boolean> {
         console.log("[AdMob] consent form result", consentInfo);
       }
       consentStillRequired = !consentInfo.canRequestAds && consentInfo.status === AdmobConsentStatus.REQUIRED;
-      publishPrivacyStatus(consentInfo.privacyOptionsRequirementStatus === "REQUIRED");
+      publishPrivacyRequirementStatus(consentInfo.privacyOptionsRequirementStatus);
       if (consentInfo.canRequestAds) {
         try {
           await requestIosTrackingAuthorization();

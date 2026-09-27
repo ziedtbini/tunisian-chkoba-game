@@ -751,6 +751,16 @@ body.theme-royal {
   animation: chkobaReveal 560ms cubic-bezier(.16,.8,.28,1.08) both;
 }
 
+.chkoba-overlay {
+  opacity: 1;
+  pointer-events: none;
+  transition: opacity 300ms ease;
+}
+
+.chkoba-overlay--fading {
+  opacity: 0;
+}
+
 .chkoba-celebration span {
   color: #7b342f;
   font-size: 0.78rem;
